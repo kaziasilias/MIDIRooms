@@ -237,7 +237,26 @@ class UsernameDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.ui = Ui_UsernameForm()
         self.ui.setupUi(self)
+        # --- responsive layout με άνετα μεγέθη ---
+        self.ui.label.setAlignment(QtCore.Qt.AlignCenter)
 
+        # μεγαλύτερο ύψος στα widgets ώστε να μην "κόβονται"
+        self.ui.usernameLine.setMinimumHeight(32)
+        self.ui.continueButton.setMinimumHeight(34)
+        self.ui.continueButton.setMinimumWidth(100)
+
+        layout = QtWidgets.QVBoxLayout()
+        layout.setContentsMargins(30, 25, 30, 25)
+        layout.setSpacing(15)
+        layout.addWidget(self.ui.label)
+        layout.addWidget(self.ui.usernameLine)
+        layout.addWidget(self.ui.continueButton, alignment=QtCore.Qt.AlignCenter)
+
+        self.setLayout(layout)
+
+        # άνετο αρχικό μέγεθος ώστε όλα να φαίνονται σωστά
+        self.resize(340, 180)
+        self.setMinimumSize(300, 160)
         self.username = None
 
         self.ui.continueButton.clicked.connect(self.on_continue)
@@ -351,6 +370,21 @@ class RoomWindow(QWidget):
         self.is_creator = is_creator
         self.ui = Ui_roomwindow()
         self.ui.setupUi(self)
+        # ξεκλείδωμα μεγέθους — επιτρέπει resize και maximize
+        self.setMinimumSize(800, 600)
+        self.setMaximumSize(16777215, 16777215)
+        # άφησε το piano scroll area να επεκτείνεται οριζόντια
+        self.ui.pianoScrollArea.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Fixed
+        )
+        self.ui.pianoScrollArea.setMaximumSize(16777215, 300)
+
+        # το log area να παίρνει τον περισσότερο κάθετο χώρο
+        self.ui.logArea.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Expanding
+        )
         self.ui.bpmSpinBox.setSuffix(" BPM")
         self.ui.StartButton.clicked.connect(self.start_recording)
         self.ui.StopButton.clicked.connect(self.stop_recording)
@@ -402,6 +436,10 @@ class RoomWindow(QWidget):
         self.logSettingsButton = QtWidgets.QPushButton("Log Settings", self)
         self.ui.horizontalLayout.addWidget(self.logSettingsButton)
         self.logSettingsButton.clicked.connect(self.open_log_settings)
+        # κουμπί για MIDI File Experiment
+        self.expButton = QtWidgets.QPushButton("Insert MIDI File", self)
+        self.ui.horizontalLayout.addWidget(self.expButton)
+        self.expButton.clicked.connect(self.open_experiment_file)
         # WebRTC objects
         self.offer_sent = False
         self.pc = None
@@ -461,6 +499,119 @@ class RoomWindow(QWidget):
         self.announce_timer.start(10000)  # κάθε 10 δευτερόλεπτα
 
         QtCore.QTimer.singleShot(3500, self.init_midi_inputs)
+    def open_experiment_file(self):
+        fname, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self, "Select MIDI file to send", "", "MIDI Files (*.mid *.midi)"
+        )
+        if fname:
+            self.start_midi_file_experiment(fname)
+    def start_midi_file_experiment(self, midi_path):
+        """
+        Πειραματική πηγή: παίζει ένα σταθερό .mid αρχείο, στέλνοντας
+        κάθε note στον άλλο χρήστη, και καταγράφει τι στάλθηκε σε CSV.
+        """
+        import mido as _mido
+
+        try:
+            mid = _mido.MidiFile(midi_path)
+        except Exception as e:
+            self.log_manager.log("ERROR", f"❌ Could not load MIDI file: {e}")
+            return
+
+        # άνοιξε CSV για τα sent events
+        import csv as _csv
+        from datetime import datetime as _dt2
+        self._exp_sent_path = f"experiment_SENT_{_dt2.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        self._exp_sent_file = open(self._exp_sent_path, "w", newline="", encoding="utf-8")
+        self._exp_sent_writer = _csv.writer(self._exp_sent_file)
+        self._exp_sent_writer.writerow(["send_time_server", "seq", "type", "note", "velocity"])
+
+        # μάζεψε όλα τα note events με τα σχετικά τους timestamps
+        self._exp_events = []
+        abs_time = 0.0
+        for msg in mid:
+            abs_time += msg.time  # msg.time είναι σε δευτερόλεπτα (mido το μετατρέπει)
+            if msg.type in ("note_on", "note_off"):
+                self._exp_events.append((abs_time, msg))
+
+        if not self._exp_events:
+            self.log_manager.log("ERROR", "❌ No notes found in MIDI file")
+            return
+
+        self.log_manager.log("SYSTEM", f"🧪 Starting MIDI experiment: {len(self._exp_events)} notes from {midi_path}")
+
+        self._exp_index = 0
+        self._exp_start_time = time.perf_counter()
+        self._exp_seq = 0
+
+        # timer που ελέγχει πότε να στείλει το επόμενο note
+        self._exp_timer = QtCore.QTimer()
+        self._exp_timer.timeout.connect(self._experiment_tick)
+        self._exp_timer.start(1)  # έλεγχος κάθε 1ms
+
+    def _experiment_tick(self):
+        """Στέλνει τα notes του .mid στη σωστή στιγμή."""
+        if self._exp_index >= len(self._exp_events):
+            self._exp_timer.stop()
+            try:
+                self._exp_sent_file.close()
+            except Exception:
+                pass
+            self.log_manager.log("SYSTEM", f"✅ Experiment finished. Sent log: {self._exp_sent_path}")
+            return
+
+        elapsed = time.perf_counter() - self._exp_start_time
+
+        # στείλε όλα τα notes που "έληξε" ο χρόνος τους
+        while (self._exp_index < len(self._exp_events) and
+               self._exp_events[self._exp_index][0] <= elapsed):
+
+            abs_time, msg = self._exp_events[self._exp_index]
+            self._exp_index += 1
+            self._exp_seq += 1
+
+            if not self.main_app.ws:
+                continue
+
+            send_ts = time.perf_counter() + self.server_clock_offset
+            note = getattr(msg, "note", None)
+            velocity = getattr(msg, "velocity", 0)
+            msg_type = msg.type
+
+            midi_event = {
+                "user": self.main_app.username,
+                "stream": "experiment",
+                "seq": self._exp_seq,
+                "timestamp": send_ts,
+                "note": note,
+                "velocity": velocity,
+                "type": msg_type,
+                "room": self.room_name,
+                "tcp_midi": True,
+                "experiment": True,   # flag για να το ξεχωρίζει ο receiver
+            }
+
+            asyncio.get_event_loop().create_task(
+                self.main_app.ws.send(json.dumps(midi_event))
+            )
+
+            # κατέγραψε τι στάλθηκε
+            try:
+                self._exp_sent_writer.writerow([f"{send_ts:.6f}", self._exp_seq, msg_type, note, velocity])
+                self._exp_sent_file.flush()
+            except Exception:
+                pass
+    def _open_experiment_receiver_log(self):
+        """Ανοίγει CSV για καταγραφή των ληφθέντων πειραματικών notes."""
+        import csv as _csv
+        from datetime import datetime as _dt2
+        self._exp_recv_path = f"experiment_RECEIVED_{_dt2.now().strftime('%Y%m%d_%H%M%S')}.csv"
+        self._exp_recv_file = open(self._exp_recv_path, "w", newline="", encoding="utf-8")
+        self._exp_recv_writer = _csv.writer(self._exp_recv_file)
+        self._exp_recv_writer.writerow(
+            ["send_time_server", "recv_time_server", "latency_ms", "seq", "type", "note", "velocity"]
+        )
+        self.log_manager.log("SYSTEM", f"🧪 Recording received experiment to: {self._exp_recv_path}")
     def init_midi_inputs(self):
         import mido
 
@@ -1171,6 +1322,22 @@ class RoomWindow(QWidget):
                 velocity=velocity,
                 channel=0
             )
+            # --- Πειραματική καταγραφή receiver ---
+            if data.get("experiment"):
+                recv_ts = time.perf_counter() + self.server_clock_offset
+                send_ts = data.get("timestamp", recv_ts)
+                seq = data.get("seq")
+                if not hasattr(self, "_exp_recv_writer"):
+                    self._open_experiment_receiver_log()
+                try:
+                    latency_ms = (recv_ts - send_ts) * 1000.0
+                    self._exp_recv_writer.writerow([
+                        f"{send_ts:.6f}", f"{recv_ts:.6f}", f"{latency_ms:.3f}",
+                        seq, msg_type, note, velocity
+                    ])
+                    self._exp_recv_file.flush()
+                except Exception:
+                    pass
             if hasattr(self.main_app, "seen_streams"):
                 self.main_app.seen_streams.add((user, stream))
 
@@ -2024,14 +2191,18 @@ class MidiUserApp(QMainWindow):
         import re
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
+        # ξεκλείδωμα μεγέθους — επιτρέπει resize και maximize
+        self.setMinimumSize(800, 600)
+        self.setMaximumSize(16777215, 16777215)
+        self._build_responsive_layout()
         self.username = ""
         # Hide old username input widgets from the main window
         self.ui.usernamelabel.hide()
         self.ui.usernamelineEdit.hide()
 
-        self.username_display = QtWidgets.QLabel(self.ui.centralwidget)
+        self.username_display = QtWidgets.QLabel(self)
         self.username_display.setObjectName("username_display")
-        self.username_display.setGeometry(QtCore.QRect(860, 10, 220, 24))
+        self.username_display.setGeometry(QtCore.QRect(860, 32, 220, 24))
         self.username_display.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
         self.username_display.setStyleSheet("font-weight: bold;")
         self.username_display.setText("User: -")
@@ -2060,6 +2231,40 @@ class MidiUserApp(QMainWindow):
         self.ensure_vmidi_bridge()
         self.instance_suffix = f"{os.getpid() % 100:02d}"
 
+    def _build_responsive_layout(self):
+        """Τυλίγει τα widgets του main window σε responsive layout."""
+        cw = self.ui.centralwidget
+
+        main_layout = QtWidgets.QVBoxLayout()
+        main_layout.setContentsMargins(20, 30, 20, 20)
+        main_layout.setSpacing(15)
+
+        # App name (κεντραρισμένο)
+        self.ui.appnamelabel.setAlignment(QtCore.Qt.AlignCenter)
+        main_layout.addWidget(self.ui.appnamelabel, alignment=QtCore.Qt.AlignCenter)
+
+        main_layout.addSpacing(30)
+
+        # Servers label (κεντραρισμένο)
+        self.ui.serverslabel.setAlignment(QtCore.Qt.AlignCenter)
+        main_layout.addWidget(self.ui.serverslabel, alignment=QtCore.Qt.AlignCenter)
+
+        # Server list (μεγαλώνει, κεντραρισμένη με max width)
+        self.ui.serverListWidget.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding
+        )
+        self.ui.serverListWidget.setMaximumWidth(900)
+        list_row = QtWidgets.QHBoxLayout()
+        list_row.addStretch(1)
+        list_row.addWidget(self.ui.serverListWidget, stretch=3)
+        list_row.addStretch(1)
+        main_layout.addLayout(list_row, stretch=1)
+
+        main_layout.addSpacing(20)
+
+        # Buttons (Create Room / Connect, κεντραρισμένα)
+        main_layout.addWidget(self.ui.layoutWidget, alignment=QtCore.Qt.AlignCenter)
+        cw.setLayout(main_layout)
     def debug_dump_midi_ports(self, label=""):
         try:
             ins = mido.get_input_names()
@@ -2106,7 +2311,7 @@ class MidiUserApp(QMainWindow):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         if hasattr(self, "username_display"):
-            self.username_display.setGeometry(self.width() - 240, 10, 220, 24)
+            self.username_display.setGeometry(self.width() - 240, 32, 220, 24)
     def sanitize_vmidi_name(self, s: str, max_len: int = 31) -> str:
         s = (s or "").strip()
         s = re.sub(r"[^A-Za-z0-9_]+", "_", s)
@@ -2416,6 +2621,8 @@ class SettingsWindow(QMainWindow):
 
 
 if __name__ == "__main__":
+    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
+    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
     import ctypes
     ctypes.windll.winmm.timeBeginPeriod(1)   # set timer resolution to 1 ms
     app = QtWidgets.QApplication(sys.argv)

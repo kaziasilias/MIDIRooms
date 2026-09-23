@@ -886,6 +886,10 @@ class RoomWindow(QWidget):
                 stream_id = self.main_app.make_stream_id(dev_name, idx)
                 streams.append({"stream": stream_id, "device": dev_name})
 
+        # πάντα ανακοίνωσε και το backing stream, ώστε ο παραλήπτης
+        # να έχει έτοιμο virtual port πριν ξεκινήσει το streaming αρχείου
+        streams.append({"stream": "backing", "device": "Backing Track"})
+
         self.send_to_room({
             "type": "streams_announce",
             "user": self.main_app.username,

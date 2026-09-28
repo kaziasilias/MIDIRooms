@@ -355,96 +355,6 @@ class PianoWidget(QtWidgets.QWidget):
             else:
                 btn.setStyleSheet("background:#000; border:1px solid #333;")
 
-class MidiStreamerDialog(QtWidgets.QDialog):
-    """Παράθυρο ελέγχου streaming ενός MIDI αρχείου ως backing track."""
-    def __init__(self, room_window):
-        super().__init__()
-        self.room_window = room_window
-        room_window._streamer_dialog = self
-        self.setWindowTitle("MIDI Streamer — Backing Track")
-        self.resize(420, 220)
-
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setSpacing(12)
-        layout.setContentsMargins(20, 20, 20, 20)
-
-        self.fileLabel = QtWidgets.QLabel("Δεν έχει φορτωθεί αρχείο")
-        self.fileLabel.setAlignment(QtCore.Qt.AlignCenter)
-        layout.addWidget(self.fileLabel)
-
-        self.loadBtn = QtWidgets.QPushButton("📂 Load MIDI File")
-        self.loadBtn.setMinimumHeight(36)
-        self.loadBtn.clicked.connect(self.on_load)
-        layout.addWidget(self.loadBtn)
-
-        row = QtWidgets.QHBoxLayout()
-        self.playBtn = QtWidgets.QPushButton("▶ Play")
-        self.playBtn.setMinimumHeight(40)
-        self.playBtn.clicked.connect(self.on_play)
-        self.playBtn.setEnabled(False)
-        row.addWidget(self.playBtn)
-
-        self.stopBtn = QtWidgets.QPushButton("⏹ Stop")
-        self.stopBtn.setMinimumHeight(40)
-        self.stopBtn.clicked.connect(self.on_stop)
-        self.stopBtn.setEnabled(False)
-        row.addWidget(self.stopBtn)
-
-        self.resetBtn = QtWidgets.QPushButton("⏮ Reset")
-        self.resetBtn.setMinimumHeight(40)
-        self.resetBtn.clicked.connect(self.on_reset)
-        self.resetBtn.setEnabled(False)
-        row.addWidget(self.resetBtn)
-        layout.addLayout(row)
-
-        self.statusLabel = QtWidgets.QLabel("")
-        self.statusLabel.setAlignment(QtCore.Qt.AlignCenter)
-        self.statusLabel.setStyleSheet("color: gray;")
-        layout.addWidget(self.statusLabel)
-
-    def on_load(self):
-        fname, _ = QtWidgets.QFileDialog.getOpenFileName(
-            self, "Select MIDI file", "", "MIDI Files (*.mid *.midi)"
-        )
-        if fname:
-            ok = self.room_window.load_midi_file(fname)
-            if ok:
-                import os
-                self.fileLabel.setText(os.path.basename(fname))
-                self.playBtn.setEnabled(True)
-                self.resetBtn.setEnabled(True)
-                self.stopBtn.setEnabled(False)
-                self.statusLabel.setText("Έτοιμο για Play")
-
-    def on_play(self):
-        self.room_window.play_midi_stream()
-        self.playBtn.setEnabled(False)
-        self.stopBtn.setEnabled(True)
-        self.statusLabel.setText("▶️ Παίζει...")
-
-    def on_stop(self):
-        self.room_window.stop_midi_stream()
-        self.playBtn.setEnabled(True)
-        self.stopBtn.setEnabled(False)
-        self.statusLabel.setText("⏹️ Σταματημένο")
-
-    def on_reset(self):
-        self.room_window.reset_midi_stream()
-        self.playBtn.setEnabled(False)
-        self.stopBtn.setEnabled(True)
-        self.statusLabel.setText("⏮️ Από την αρχή...")
-
-    def on_stream_finished(self):
-        self.playBtn.setEnabled(True)
-        self.stopBtn.setEnabled(False)
-        self.statusLabel.setText("✅ Ολοκληρώθηκε")
-
-    def closeEvent(self, event):
-        # πλήρης κατάρρευση — κανένα υπόλειμμα
-        self.room_window.cleanup_stream()
-        self.room_window._streamer_dialog = None
-        event.accept()
-
 class RoomWindow(QWidget):
     def __init__(self, main_app, room_name="lobby", is_creator=False):
         super().__init__()
@@ -524,10 +434,6 @@ class RoomWindow(QWidget):
         self.logSettingsButton = QtWidgets.QPushButton("Log Settings", self)
         self.ui.horizontalLayout.addWidget(self.logSettingsButton)
         self.logSettingsButton.clicked.connect(self.open_log_settings)
-        # κουμπί για MIDI File Experiment
-        self.streamButton = QtWidgets.QPushButton("Stream MIDI File", self)
-        self.ui.horizontalLayout.addWidget(self.streamButton)
-        self.streamButton.clicked.connect(self.open_stream_dialog)
         # WebRTC objects
         self.offer_sent = False
         self.pc = None
@@ -588,222 +494,6 @@ class RoomWindow(QWidget):
 
         QtCore.QTimer.singleShot(3500, self.init_midi_inputs)
 
-    def open_stream_dialog(self):
-        """Ανοίγει το ξεχωριστό παράθυρο ελέγχου streaming."""
-        dlg = MidiStreamerDialog(self)
-        dlg.exec_()
-
-    def load_midi_file(self, midi_path):
-        """Φορτώνει και αποδομεί το .mid σε λίστα από note events."""
-        import mido as _mido
-        self.stop_midi_stream()  # σταμάτα ό,τι παίζει
-
-        try:
-            mid = _mido.MidiFile(midi_path)
-        except Exception as e:
-            self.log_manager.log("ERROR", f"❌ Could not load MIDI file: {e}")
-            return False
-
-        self._exp_events = []
-        abs_time = 0.0
-        for msg in mid:
-            abs_time += msg.time
-            if msg.type in ("note_on", "note_off"):
-                self._exp_events.append((abs_time, msg))
-
-        if not self._exp_events:
-            self.log_manager.log("ERROR", "❌ No notes found in MIDI file")
-            self._exp_loaded = False
-            return False
-
-        self._exp_loaded = True
-        self._exp_playing = False
-        self._exp_index = 0
-        self._exp_seq = 0
-        self.log_manager.log("SYSTEM", f"🎵 Loaded {len(self._exp_events)} notes — έτοιμο για Play")
-        return True
-
-    def _ensure_backing_port(self):
-        """Δημιουργεί (αν δεν υπάρχει) το τοπικό virtual port για να ακούς το backing track."""
-        if getattr(self, "_backing_port_name", None):
-            return
-        safe_user = self.main_app.sanitize_vmidi_name(self.main_app.username, max_len=18)
-        name = f"{safe_user}_backing"[:31]
-        if getattr(self.main_app, "vmidi", None):
-            ok = self.main_app.vmidi.create(name)
-            if ok:
-                self.main_app.created_vmidi_ports.add(name)
-                self._backing_port_name = name
-                self.log_manager.log("SYSTEM", f"🎚️ Created local backing port: {name}")
-            else:
-                self._backing_port_name = None
-                self.log_manager.log("ERROR", f"❌ Failed to create backing port: {name}")
-
-    def play_midi_stream(self):
-        """Ξεκινά το streaming του backing track (τοπικά + δίκτυο)."""
-        if not getattr(self, "_exp_loaded", False) or not getattr(self, "_exp_events", None):
-            self.log_manager.log("ERROR", "❌ Δεν έχει φορτωθεί MIDI αρχείο")
-            return
-        if getattr(self, "_exp_playing", False):
-            return
-
-        self._ensure_backing_port()  # για να το ακούς εσύ τοπικά
-
-        # άνοιξε νέο CSV μόνο αν ξεκινάμε από την αρχή (όχι σε resume)
-        if getattr(self, "_exp_index", 0) == 0 or getattr(self, "_exp_sent_file", None) is None:
-            import csv as _csv
-            from datetime import datetime as _dt2
-            _u = self.main_app.sanitize_vmidi_name(self.main_app.username, max_len=12)
-            self._exp_sent_path = f"experiment_SENT_{_u}_{_dt2.now().strftime('%Y%m%d_%H%M%S')}.csv"
-            self._exp_sent_file = open(self._exp_sent_path, "w", newline="", encoding="utf-8")
-            self._exp_sent_writer = _csv.writer(self._exp_sent_file)
-            self._exp_sent_writer.writerow(["send_time_server", "seq", "type", "note", "velocity"])
-
-        # αν συνεχίζουμε από pause, κράτα τη θέση· αλλιώς ξεκίνα από την αρχή
-        resume_index = getattr(self, "_exp_index", 0)
-        if resume_index >= len(self._exp_events):
-            resume_index = 0  # αν είχε τελειώσει, ξεκίνα από την αρχή
-
-        self._exp_index = resume_index
-        # ο χρόνος αναφοράς μετατοπίζεται ώστε το elapsed να ταιριάζει με το note που μένει
-        resume_time = self._exp_events[resume_index][0] if resume_index < len(self._exp_events) else 0.0
-        self._exp_start_time = time.perf_counter() - resume_time
-        self._exp_playing = True
-
-        self._exp_timer = QtCore.QTimer()
-        self._exp_timer.timeout.connect(self._experiment_tick)
-        self._exp_timer.start(1)
-        self.log_manager.log("SYSTEM", f"▶️ Backing track streaming: {len(self._exp_events)} notes")
-
-    def stop_midi_stream(self):
-        """Σταματά το streaming (pause)."""
-        if getattr(self, "_exp_timer", None):
-            try:
-                self._exp_timer.stop()
-            except Exception:
-                pass
-        self._exp_playing = False
-        # σταμάτα όλες τις νότες που ηχούν, ώστε να μην κολλήσουν
-        self._all_notes_off()
-        # ΔΕΝ κλείνουμε το CSV εδώ — το pause επιτρέπει resume
-
-    def reset_midi_stream(self):
-        """Επαναφορά στην αρχή και επανεκκίνηση."""
-        self.stop_midi_stream()
-        self._exp_index = 0  # μηδένισε τη θέση
-        # κλείσε το τρέχον CSV ώστε το reset να ξεκινήσει νέο
-        try:
-            if getattr(self, "_exp_sent_file", None):
-                self._exp_sent_file.close()
-                self._exp_sent_file = None
-        except Exception:
-            pass
-        if getattr(self, "_exp_loaded", False):
-            self.log_manager.log("SYSTEM", "⏮️ Reset — από την αρχή")
-            self.play_midi_stream()
-
-    def cleanup_stream(self):
-        """Πλήρης κατάρρευση — καλείται όταν κλείνει το dialog."""
-        self.stop_midi_stream()
-        # διάγραψε το backing port
-        try:
-            if getattr(self, "_backing_port_name", None) and getattr(self.main_app, "vmidi", None):
-                self.main_app.vmidi.close(self._backing_port_name)
-                self.main_app.created_vmidi_ports.discard(self._backing_port_name)
-                self.log_manager.log("SYSTEM", f"🧹 Closed backing port: {self._backing_port_name}")
-        except Exception:
-            pass
-        self._backing_port_name = None
-        self._exp_loaded = False
-        self._exp_playing = False
-        self._exp_events = []
-        self._exp_index = 0
-        self._active_notes = set()
-
-    def _experiment_tick(self):
-        """Στέλνει τα notes του backing track στη σωστή στιγμή (τοπικά + δίκτυο)."""
-        if self._exp_index >= len(self._exp_events):
-            self._exp_timer.stop()
-            self._exp_playing = False
-            try:
-                if getattr(self, "_exp_sent_file", None):
-                    self._exp_sent_file.close()
-                    self._exp_sent_file = None
-            except Exception:
-                pass
-            self.log_manager.log("SYSTEM", "✅ Backing track finished")
-            if getattr(self, "_streamer_dialog", None):
-                self._streamer_dialog.on_stream_finished()
-            return
-
-        elapsed = time.perf_counter() - self._exp_start_time
-
-        while (self._exp_index < len(self._exp_events) and
-               self._exp_events[self._exp_index][0] <= elapsed):
-
-            abs_time, msg = self._exp_events[self._exp_index]
-            self._exp_index += 1
-            self._exp_seq += 1
-
-            note = getattr(msg, "note", None)
-            velocity = getattr(msg, "velocity", 0)
-            msg_type = msg.type
-            # παρακολούθηση ενεργών νοτών (για all-notes-off στο pause)
-            if not hasattr(self, "_active_notes"):
-                self._active_notes = set()
-            if msg_type == "note_on" and velocity > 0:
-                self._active_notes.add(note)
-            elif msg_type == "note_off" or (msg_type == "note_on" and velocity == 0):
-                self._active_notes.discard(note)
-
-            # 1) ΤΟΠΙΚΑ — παίξε το στο backing port για να το ακούς εσύ
-            if getattr(self, "_backing_port_name", None) and getattr(self.main_app, "vmidi", None):
-                try:
-                    m = Message(msg_type, note=note, velocity=velocity)
-                    hex_bytes = " ".join(f"{x:02X}" for x in m.bytes())
-                    if msg_type == "note_off" or velocity == 0:
-                        self.main_app.vmidi.send_hex(self._backing_port_name, hex_bytes)
-                    else:
-                        self.main_app.vmidi.send_hex_nowait(self._backing_port_name, hex_bytes)
-                except Exception:
-                    pass
-
-            # 2) ΔΙΚΤΥΟ — στείλε στον άλλο χρήστη με stream "backing"
-            if self.main_app.ws:
-                send_ts = time.perf_counter() + self.server_clock_offset
-                midi_event = {
-                    "user": self.main_app.username,
-                    "stream": "backing",
-                    "seq": self._exp_seq,
-                    "timestamp": send_ts,
-                    "note": note,
-                    "velocity": velocity,
-                    "type": msg_type,
-                    "room": self.room_name,
-                    "tcp_midi": True,
-                    "experiment": True,
-                }
-                asyncio.get_event_loop().create_task(
-                    self.main_app.ws.send(json.dumps(midi_event))
-                )
-                try:
-                    self._exp_sent_writer.writerow([f"{send_ts:.6f}", self._exp_seq, msg_type, note, velocity])
-                    self._exp_sent_file.flush()
-                except Exception:
-                    pass
-    def _open_experiment_receiver_log(self):
-        """Ανοίγει CSV για καταγραφή των ληφθέντων πειραματικών notes."""
-        import csv as _csv
-        from datetime import datetime as _dt2
-        _u = self.main_app.sanitize_vmidi_name(self.main_app.username, max_len=12)
-        self._exp_recv_path = f"experiment_RECEIVED_{_u}_{_dt2.now().strftime('%Y%m%d_%H%M%S')}.csv"
-        self._exp_recv_file = open(self._exp_recv_path, "w", newline="", encoding="utf-8")
-        self._exp_recv_writer = _csv.writer(self._exp_recv_file)
-        self._exp_recv_writer.writerow(
-            ["send_time_server", "recv_time_server", "latency_ms",
-             "server_offset_ms", "server_jitter_ms", "seq", "type", "note", "velocity"]
-        )
-        self.log_manager.log("SYSTEM", f"🧪 Recording received experiment to: {self._exp_recv_path}")
     def init_midi_inputs(self):
         import mido
 
@@ -885,10 +575,6 @@ class RoomWindow(QWidget):
             for idx, dev_name in enumerate(selected_inputs, start=1):
                 stream_id = self.main_app.make_stream_id(dev_name, idx)
                 streams.append({"stream": stream_id, "device": dev_name})
-
-        # πάντα ανακοίνωσε και το backing stream, ώστε ο παραλήπτης
-        # να έχει έτοιμο virtual port πριν ξεκινήσει το streaming αρχείου
-        streams.append({"stream": "backing", "device": "Backing Track"})
 
         self.send_to_room({
             "type": "streams_announce",
@@ -1209,6 +895,9 @@ class RoomWindow(QWidget):
         except Exception:
             pass
         self.main_app.show()
+        self.main_app.raise_()
+        self.main_app.activateWindow()
+        QtWidgets.QApplication.processEvents()  # σιγουρέψου ότι έγινε visible
         try:
             if getattr(self.main_app, "vmidi", None) and getattr(self, "metronome_port_name", None):
                 self.main_app.vmidi.close(self.metronome_port_name)
@@ -1367,12 +1056,6 @@ class RoomWindow(QWidget):
         port_name = None
         try:
             data = json.loads(message)
-            recv_ts = time.perf_counter()
-            if "input_ts" in data:
-                sender = data.get("user")
-                offset = self.clock_offset_from_peer.get(sender, 0.0)
-                sender_time_on_my_clock = data["input_ts"] - offset
-                print(f"PYTHON INPUT→RECEIVE = {(recv_ts - sender_time_on_my_clock) * 1000:.2f} ms")
 
             if data.get("type") == "metronome_start":
                 self.start_local_metronome(
@@ -1518,30 +1201,6 @@ class RoomWindow(QWidget):
                 velocity=velocity,
                 channel=0
             )
-            # --- Πειραματική καταγραφή receiver ---
-            if data.get("experiment"):
-                recv_ts = time.perf_counter() + self.server_clock_offset
-                send_ts = data.get("timestamp", recv_ts)
-                seq = data.get("seq")
-                if not hasattr(self, "_exp_recv_writer"):
-                    self._open_experiment_receiver_log()
-                try:
-                    latency_ms = (recv_ts - send_ts) * 1000.0
-                    offset_ms = self.server_clock_offset * 1000.0
-                    jitter_ms = self.peer_jitter.get("_server", 0.0) * 1000.0
-                    self._exp_recv_writer.writerow([
-                        f"{send_ts:.6f}", f"{recv_ts:.6f}", f"{latency_ms:.3f}",
-                        f"{offset_ms:.3f}", f"{jitter_ms:.3f}",
-                        seq, msg_type, note, velocity
-                    ])
-                    self._exp_recv_file.flush()
-                except Exception:
-                    pass
-            if hasattr(self.main_app, "seen_streams"):
-                self.main_app.seen_streams.add((user, stream))
-            self.log_manager.log(None, f"received {msg_type} note={note}", peer=user)
-            #print("🎵 Received MIDI event:", data)
-            self.add_user_ui(user)
 
             # Update velocity bar
             if note is not None:
@@ -1619,11 +1278,9 @@ class RoomWindow(QWidget):
                 route = self.main_app.routing_config.get((user, stream))
                 vmidi_name = None
                 channel = 1
-
                 if route:
                     vmidi_name = route.get("vmidi")
                     channel = route.get("channel", 1)
-
                 msg.channel = (int(channel) - 1) if channel else 0
 
                 if vmidi_name and getattr(self.main_app, "vmidi", None):
@@ -2035,43 +1692,7 @@ class RoomWindow(QWidget):
             "velocity": velocity,
             "channel": channel
         })
-    def _all_notes_off(self):
-        """Στέλνει note_off για όλες τις ενεργές νότες του backing track (τοπικά + δίκτυο)."""
-        active = getattr(self, "_active_notes", set())
-        if not active:
-            return
 
-        for note in list(active):
-            # 1) ΤΟΠΙΚΑ — σταμάτα τη νότα στο backing port
-            if getattr(self, "_backing_port_name", None) and getattr(self.main_app, "vmidi", None):
-                try:
-                    m = Message("note_off", note=note, velocity=0)
-                    hex_bytes = " ".join(f"{x:02X}" for x in m.bytes())
-                    self.main_app.vmidi.send_hex(self._backing_port_name, hex_bytes)
-                except Exception:
-                    pass
-
-            # 2) ΔΙΚΤΥΟ — στείλε note_off στον άλλο χρήστη
-            if self.main_app.ws:
-                self._exp_seq += 1
-                send_ts = time.perf_counter() + self.server_clock_offset
-                midi_event = {
-                    "user": self.main_app.username,
-                    "stream": "backing",
-                    "seq": self._exp_seq,
-                    "timestamp": send_ts,
-                    "note": note,
-                    "velocity": 0,
-                    "type": "note_off",
-                    "room": self.room_name,
-                    "tcp_midi": True,
-                    "experiment": True,
-                }
-                asyncio.get_event_loop().create_task(
-                    self.main_app.ws.send(json.dumps(midi_event))
-                )
-
-        self._active_notes.clear()
 class RoutingManager(QDialog):
     def __init__(self, main_app):
         super().__init__()
@@ -2792,6 +2413,7 @@ class MidiUserApp(QMainWindow):
             pass
 
         event.accept()
+        QtWidgets.QApplication.quit()
 
 
 class SettingsWindow(QMainWindow):
@@ -2862,6 +2484,7 @@ if __name__ == "__main__":
     import ctypes
     ctypes.windll.winmm.timeBeginPeriod(1)   # set timer resolution to 1 ms
     app = QtWidgets.QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
 
     loop = QEventLoop(app)
     asyncio.set_event_loop(loop)

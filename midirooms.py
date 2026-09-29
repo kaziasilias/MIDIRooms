@@ -166,12 +166,12 @@ class VirtualMidiBridge:
 
     def _cmd(self, line: str) -> str:
         with self._lock:
-            #print("BRIDGE CMD ->", line)
             self.p.stdin.write(line + "\n")
             self.p.stdin.flush()
-            resp = self._q.get()
-            #print("BRIDGE RESP <-", resp)
-            return resp
+            try:
+                return self._q.get(timeout=2.0)
+            except queue.Empty:
+                return "ERR timeout"
 
     def create(self, name: str) -> bool:
         resp = self._cmd(f"CREATE|{name}")
@@ -207,13 +207,8 @@ class VirtualMidiBridge:
             return False
 
     def send_hex_nowait(self, name: str, hex_bytes: str):
-        """Fire-and-forget MIDI send — does not wait for OK response."""
-        try:
-            with self._lock:
-                self.p.stdin.write(f"SEND|{name}|{hex_bytes}\n")
-                self.p.stdin.flush()
-        except Exception as e:
-            print(f"❌ Bridge nowait send failed for {name}: {e}")
+        """Στέλνει MIDI και ΔΙΑΒΑΖΕΙ το OK, ώστε να μη μένουν ορφανές απαντήσεις."""
+        self.send_hex(name, hex_bytes)
 
     def shutdown(self):
         for name in list(self.output_cache.keys()):
@@ -778,6 +773,7 @@ class RoomWindow(QWidget):
 
         self.server_clock_offset = offset
 
+
         # jitter tracking
         rtt_ms = rtt * 1000
         self.server_rtt_samples.append(rtt_ms)
@@ -895,9 +891,6 @@ class RoomWindow(QWidget):
         except Exception:
             pass
         self.main_app.show()
-        self.main_app.raise_()
-        self.main_app.activateWindow()
-        QtWidgets.QApplication.processEvents()  # σιγουρέψου ότι έγινε visible
         try:
             if getattr(self.main_app, "vmidi", None) and getattr(self, "metronome_port_name", None):
                 self.main_app.vmidi.close(self.metronome_port_name)
@@ -1209,15 +1202,19 @@ class RoomWindow(QWidget):
                 if velocity is not None:
                     self.bump_velocity_bar(user, velocity)
 
-                # το sender_ts είναι σε SERVER TIME — μετάτρεψέ το σε τοπικό
                 sender_ts_server = data.get("timestamp", time.perf_counter())
-                sender_ts_local = sender_ts_server - self.server_clock_offset
+                if self.server_clock_offset == 0.0:
+                    # ο συγχρονισμός ρολογιού δεν έχει ολοκληρωθεί ακόμα —
+                    # παίξε άμεσα αντί να υπολογίσεις λάθος (τεράστιο) play_time
+                    sender_ts_local = time.perf_counter()
+                else:
+                    sender_ts_local = sender_ts_server - self.server_clock_offset
 
                 jitter_s = self.peer_jitter.get("_server", 0.005)
                 adaptive_delay = max(0.015, 2.5 * jitter_s)
                 play_time = sender_ts_local + adaptive_delay
                 play_time = max(play_time, time.perf_counter() + 0.002)
-
+                print(f"CALC ts_server={sender_ts_server:.1f} my_offset={self.server_clock_offset:.1f} play_time={play_time:.1f} now={time.perf_counter():.1f} diff={play_time-time.perf_counter():.3f}")
                 is_noteoff = (msg_type == "note_off" or
                               (msg_type == "note_on" and effective_velocity == 0))
 
@@ -1259,6 +1256,11 @@ class RoomWindow(QWidget):
             return
 
         now = time.perf_counter()
+        # πέτα "δηλητηριασμένες" νότες (play_time πολύ μακριά = offset δεν είχε συγχρονιστεί)
+        while self.remote_midi_queue and (self.remote_midi_queue[0]["play_time"] - now) > 5.0:
+            self.remote_midi_queue.pop(0)
+        if not self.remote_midi_queue:
+            return
 
         ready = []
         while self.remote_midi_queue and self.remote_midi_queue[0]["play_time"] <= now:
@@ -1286,11 +1288,11 @@ class RoomWindow(QWidget):
                 if vmidi_name and getattr(self.main_app, "vmidi", None):
                     b = msg.bytes()
                     hex_bytes = " ".join(f"{x:02X}" for x in b)
-                    # note_off και velocity=0 στέλνονται αξιόπιστα για να μην κολλάνε νότες
-                    if msg_type == "note_off" or (msg_type == "note_on" and velocity == 0):
-                        self.main_app.vmidi.send_hex(vmidi_name, hex_bytes)
-                    else:
-                        self.main_app.vmidi.send_hex_nowait(vmidi_name, hex_bytes)
+                    r = self.main_app.vmidi.send_hex(vmidi_name, hex_bytes)
+                    print(f"SEND→BRIDGE port={vmidi_name} hex={hex_bytes} result={r}")
+                else:
+                    print(
+                        f"NO SEND: vmidi_name={vmidi_name} vmidi_obj={getattr(self.main_app, 'vmidi', None) is not None}")
 
             except Exception as e:
                 print("⚠️ Scheduled MIDI playback error:", e)
@@ -2485,7 +2487,6 @@ if __name__ == "__main__":
     ctypes.windll.winmm.timeBeginPeriod(1)   # set timer resolution to 1 ms
     app = QtWidgets.QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
-
     loop = QEventLoop(app)
     asyncio.set_event_loop(loop)
 

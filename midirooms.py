@@ -162,23 +162,29 @@ class VirtualMidiBridge:
 
     def _reader(self):
         for line in self.p.stdout:
-            self._q.put(line.rstrip("\n"))
+            line = line.rstrip("\n")
+            print(f"BRIDGE OUT: {line!r}")
+            self._q.put(line)
 
-    def _cmd(self, line: str) -> str:
+    def _cmd(self, line: str, timeout: float = 2.0) -> str:
         with self._lock:
+            # καθάρισε τυχόν καθυστερημένες/ορφανές απαντήσεις πριν στείλεις
+            while not self._q.empty():
+                try:
+                    self._q.get_nowait()
+                except queue.Empty:
+                    break
             self.p.stdin.write(line + "\n")
             self.p.stdin.flush()
             try:
-                return self._q.get(timeout=2.0)
+                return self._q.get(timeout=timeout)
             except queue.Empty:
                 return "ERR timeout"
-
     def create(self, name: str) -> bool:
-        resp = self._cmd(f"CREATE|{name}")
+        resp = self._cmd(f"CREATE|{name}",timeout=6.0)
+        print(f"CREATE '{name}' → reply: {resp!r}")
         if not resp.startswith("OK"):
             return False
-
-        # Give Windows a little time to expose the MIDI port
         time.sleep(0.5)
         return True
 

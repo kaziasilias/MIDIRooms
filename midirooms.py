@@ -134,6 +134,48 @@ def force_winmm_refresh():
         print(f"🔄 WinMM refresh: {count} MIDI input(s) detected")
     except Exception as e:
         print(f"⚠️ WinMM refresh failed: {e}")
+
+
+def base_name(n):
+    """Όνομα συσκευής χωρίς τον τελικό αριθμό-index που προσθέτει το RtMidi (π.χ. 'loopMIDI Port 1 4' -> 'loopmidi port 1')."""
+    return re.sub(r"\s+\d+$", "", (n or "").strip()).lower()
+
+
+VMIDI_POOL_SIZE = 4   # πόσα remote virtual ports (streams άλλων χρηστών) δημιουργούνται στην εκκίνηση.
+                      # Προσοχή: ΟΛΑ τα ports του teVirtualMIDI (και loopMIDI) είναι ένα endpoint των
+                      # Windows MIDI Services και το όριο είναι πιθανόν 16 συνολικά (UMP groups).
+                      # Για 2 instances στο ίδιο laptop βάλε 4.
+
+_zombie_ports = []   # ports που απέτυχαν να κλείσουν — τα κρατάμε ζωντανά
+
+
+def safe_close_port(port, label=""):
+    """
+    Στο παλιό RtMidi (WinMM), αν το close() αποτύχει (midiInUnprepareHeader), το αντικείμενο
+    μένει "connected" και ο destructor ξανατρέχει closePort() => διπλό delete => σιωπηλό crash.
+    Άρα αν αποτύχει, κρατάμε το αντικείμενο ζωντανό ώστε να μη γίνει ποτέ destruct.
+    """
+    try:
+        port.close()
+        return True
+    except Exception as e:
+        print(f"⚠️ close input {label} failed: {e} — keeping port alive to avoid native crash")
+        _zombie_ports.append(port)
+        return False
+
+
+def resolve_input(dev_name):
+    """Βρίσκει το ΤΡΕΧΟΝ πλήρες όνομα της συσκευής, ακόμα κι αν άλλαξε το index στο τέλος."""
+    try:
+        names = mido.get_input_names()
+    except Exception:
+        return None
+    if dev_name in names:
+        return dev_name
+    b = base_name(dev_name)
+    return next((n for n in names if base_name(n) == b), None)
+
+
 class VirtualMidiBridge:
     def __init__(self, exe_path: str):
         self.p = subprocess.Popen(
@@ -180,12 +222,12 @@ class VirtualMidiBridge:
                 return self._q.get(timeout=timeout)
             except queue.Empty:
                 return "ERR timeout"
-    def create(self, name: str) -> bool:
+    def create(self, name: str, settle: float = 0.5) -> bool:
         resp = self._cmd(f"CREATE|{name}",timeout=6.0)
         print(f"CREATE '{name}' → reply: {resp!r}")
         if not resp.startswith("OK"):
             return False
-        time.sleep(0.5)
+        time.sleep(settle)
         return True
 
     def close(self, name: str) -> bool:
@@ -360,6 +402,8 @@ class RoomWindow(QWidget):
     def __init__(self, main_app, room_name="lobby", is_creator=False):
         super().__init__()
         self.local_mute = False
+        self._left = False              # γίνεται True μετά το leave_room
+        self._vmidi_fail_ts = {}        # port_name -> τελευταία αποτυχία create
         self.main_app = main_app
         self.room_name = room_name
         self.metronome_running = False
@@ -397,15 +441,10 @@ class RoomWindow(QWidget):
             start_note=24,  # C1
             white_keys=49  # 88-key piano
         )
-        self.metronome_port_name = f"{self.main_app.username}_metronome"[:31]
-
-        if getattr(self.main_app, "vmidi", None):
-            ok = self.main_app.vmidi.create(self.metronome_port_name)
-            if ok:
-                self.main_app.created_vmidi_ports.add(self.metronome_port_name)
-                print(f"✅ Created metronome MIDI port: {self.metronome_port_name}")
-            else:
-                print(f"❌ Failed to create metronome MIDI port: {self.metronome_port_name}")
+        # Το metronome port δημιουργείται ΜΙΑ φορά στην εκκίνηση (init_vmidi_pool), όχι εδώ:
+        # ports που δημιουργούνται ενώ υπάρχει ανοιχτή σύνδεση στο teVirtualMIDI endpoint
+        # δεν είναι ορατά (δες πείραμα R2/R3).
+        self.metronome_port_name = getattr(self.main_app, "metronome_port_name", None)
         self.metronome_timer = QtCore.QTimer()
         self.metronome_timer.timeout.connect(self.metronome_tick)
         self.metronome_timer.start(10)
@@ -463,18 +502,8 @@ class RoomWindow(QWidget):
             selected_inputs = [one] if one else []
 
         self.failed_inputs = set()
+        # (αφαιρέθηκε το blocking time.sleep(3.0) — το init_midi_inputs ήδη τρέχει 3.5s αργότερα)
         if getattr(self.main_app, "midi_service_was_refreshed", False):
-            print("⏳ Waiting after MIDI service refresh...")
-            QtWidgets.QApplication.processEvents()
-            time.sleep(3.0)
-
-            # Force mido/WinMM to re-enumerate fresh
-            try:
-                print("🔄 Fresh MIDI inputs:", mido.get_input_names())
-                print("🔄 Fresh MIDI outputs:", mido.get_output_names())
-            except Exception as e:
-                print("⚠️ MIDI rescan failed:", e)
-
             self.main_app.midi_service_was_refreshed = False
 
         # Poll MIDI input
@@ -500,27 +529,22 @@ class RoomWindow(QWidget):
 
         print("🚀 Initializing MIDI inputs AFTER delay...")
 
-        self.midi_inputs = []
-        self.stream_devices = {}
+        if self._left:
+            return
 
-        selected_inputs = getattr(self.main_app, "selected_inputs", []) or []
+        # (δεν μηδενίζουμε τις λίστες εδώ: το hotplug μπορεί ήδη να άνοιξε τη συσκευή στα 3s,
+        #  και το try_reopen_device ελέγχει ήδη αν είναι ανοιχτή)
+        selected_inputs = list(getattr(self.main_app, "selected_inputs", []) or [])
 
-        available_inputs = mido.get_input_names()
-        print("🎹 Available inputs after delay:", available_inputs)
+        try:
+            print("🎹 Available inputs after delay:", mido.get_input_names())
+        except Exception as e:
+            print("⚠️ get_input_names failed:", e)
 
-        for idx, dev_name in enumerate(selected_inputs, start=1):
-            inport = self.open_midi_input_with_retry(dev_name)
-
-            if not inport:
-                print(f"❌ Could not open MIDI input: {dev_name}")
-                continue
-
-            stream_id = self.main_app.make_stream_id(dev_name, idx)
-
-            self.midi_inputs.append((stream_id, inport))
-            self.stream_devices[stream_id] = dev_name
-
-            print(f"✅ Opened MIDI input: {dev_name}")
+        # try_reopen_device είναι NON-BLOCKING (QTimer retries) και ανοίγει
+        # τη συσκευή με σταθερή αντιστοίχιση ονόματος (resolve_input).
+        for dev_name in selected_inputs:
+            self.try_reopen_device(dev_name)
 
     def send_to_room(self, payload: dict):
         """Στέλνει message σε όλους στο δωμάτιο μέσω WebSocket (TCP)."""
@@ -533,34 +557,20 @@ class RoomWindow(QWidget):
             )
         except Exception as e:
             self.log_manager.log("ERROR", f"⚠️ send_to_room failed: {e}")
-    def open_midi_input_with_retry(self, dev_name, retries=12, delay_ms=1000):
+    def open_midi_input_with_retry(self, dev_name, retries=1, delay_ms=0):
+        """Μία μόνο προσπάθεια, ΧΩΡΙΣ sleep (δεν μπλοκάρει Qt/asyncio). Τα retries γίνονται από try_reopen_device."""
         from mido import open_input
 
-        for attempt in range(1, retries + 1):
-            try:
-                available = mido.get_input_names()
-                print(f"🔎 Available MIDI inputs attempt {attempt}: {available}")
-
-                real_name = next((n for n in available if n == dev_name), None)
-
-                if not real_name:
-                    # fallback για cases τύπου "MPK mini 3 0" vs renamed instance
-                    base = dev_name.lower().split(" 0")[0]
-                    real_name = next((n for n in available if base in n.lower()), None)
-
-                if not real_name:
-                    print(f"⚠️ {dev_name} not visible yet")
-                    time.sleep(delay_ms / 1000)
-                    continue
-
-                print(f"🎹 Trying to open MIDI input {real_name} ({attempt}/{retries})")
-                return open_input(real_name)
-
-            except Exception as e:
-                print(f"⚠️ Failed attempt {attempt}/{retries} opening {dev_name}: {e}")
-                time.sleep(delay_ms / 1000)
-
-        return None
+        real_name = resolve_input(dev_name)
+        if not real_name:
+            print(f"⚠️ {dev_name} not visible yet")
+            return None
+        try:
+            print(f"🎹 Opening MIDI input {real_name}")
+            return open_input(real_name)
+        except Exception as e:
+            print(f"⚠️ Failed opening {dev_name} ({real_name}): {e}")
+            return None
 
 
     def send_streams_announce(self):
@@ -625,26 +635,23 @@ class RoomWindow(QWidget):
         import mido
         from mido import open_input
 
-        def should_ignore_input(name: str) -> bool:
-            n = (name or "").lower()
-            vmidi_lower = {v.lower() for v in getattr(self.main_app, "created_vmidi_ports", set())}
-            if n in vmidi_lower:
-                return True
-            return False
+        if self._left:
+            return
 
-        current_names = [n for n in mido.get_input_names() if not should_ignore_input(n)]
-        selected_inputs = set(getattr(self.main_app, "selected_inputs", []) or [])
+        selected_inputs = list(getattr(self.main_app, "selected_inputs", []) or [])
         if not selected_inputs:
             return  # ✅ don't auto-open devices unless user selected them in settings
 
-        if selected_inputs:
-            current_names = [n for n in current_names if n in selected_inputs]
-
-        opened_names = set(n.lower() for n in self.stream_devices.values() if n)
-
-        new_devices = [d for d in current_names if d.lower() not in opened_names]
+        # Σύγκριση με base_name (χωρίς το index του WinMM που αλλάζει)
+        opened_bases = {base_name(n) for n in self.stream_devices.values() if n}
         failed = getattr(self, "failed_inputs", set())
-        new_devices = [d for d in new_devices if d.lower() not in failed]
+
+        new_devices = [
+            d for d in selected_inputs
+            if base_name(d) not in opened_bases
+            and d.lower() not in failed
+            and resolve_input(d)          # μόνο όσες φαίνονται τώρα στο σύστημα
+        ]
 
         if not new_devices:
             return
@@ -686,9 +693,13 @@ class RoomWindow(QWidget):
         """
         MAX_ATTEMPTS = 20  # δοκίμασε έως 20 φορές (60 δευτερόλεπτα συνολικά)
 
-        # αν έχει ήδη ξανανοιχτεί, σταμάτα
+        # αν έχουμε φύγει από το δωμάτιο, μην ξανανοίξεις τίποτα
+        if self._left:
+            return
+
+        # αν έχει ήδη ξανανοιχτεί, σταμάτα (σύγκριση χωρίς το index του WinMM)
         already_open = any(
-            self.stream_devices.get(sid, "").lower() == dev_name.lower()
+            base_name(self.stream_devices.get(sid, "")) == base_name(dev_name)
             for sid, _ in self.midi_inputs
         )
         if already_open:
@@ -707,16 +718,8 @@ class RoomWindow(QWidget):
         # Force WinMM να ξαναδεί τις συσκευές
         force_winmm_refresh()
 
-        try:
-            available = mido.get_input_names()
-        except Exception:
-            available = []
-
-        # ψάξε exact match ή partial match
-        real_name = next((n for n in available if n == dev_name), None)
-        if not real_name:
-            base = dev_name.lower().split(" 0")[0]
-            real_name = next((n for n in available if base in n.lower()), None)
+        # exact match, αλλιώς match με base_name (το index στο τέλος αλλάζει)
+        real_name = resolve_input(dev_name)
 
         if not real_name:
             # δεν φαίνεται ακόμα — ξαναδοκίμασε σε 3 δευτερόλεπτα
@@ -820,6 +823,20 @@ class RoomWindow(QWidget):
             QtCore.QTimer.singleShot(200, self.send_streams_announce)
 
     def leave_room(self):
+        if self._left:
+            return          # ήδη έχουμε φύγει (π.χ. kicked + leave)
+        self._left = True
+
+        # σταμάτα ΟΛΑ τα timers πρώτα (προηγουμένως έμεναν ενεργά το
+        # remote_playback_timer και το metronome_timer)
+        for _t in ("timer", "ping_timer", "hotplug_timer", "announce_timer",
+                   "remote_playback_timer", "metronome_timer"):
+            try:
+                getattr(self, _t).stop()
+            except Exception:
+                pass
+        self.remote_midi_queue.clear()
+
         if self.main_app.ws:
             asyncio.get_event_loop().create_task(
                 self.main_app.ws.send(json.dumps({
@@ -858,52 +875,34 @@ class RoomWindow(QWidget):
             self.announce_timer.stop()
         except Exception:
             pass
-        # Close ALL remote vmidi ports created for this room session
-        try:
-            if getattr(self.main_app, "vmidi", None):
-                for (u, s), route in list(self.main_app.routing_config.items()):
-                    # 🔒 Do NOT close my local port
-                    if u == self.main_app.username:
-                        continue
+        # Τα virtual ports ΔΕΝ κλείνουν στο Leave: ανήκουν στο pool της εφαρμογής και
+        # μένουν ανοιχτά μέχρι να κλείσει η εφαρμογή (routing_config.clear() παρακάτω
+        # ελευθερώνει τα slots).
+        print("♻️ vmidi ports kept (slots released)")
 
-                    vm = route.get("vmidi")
-                    if vm:
-                        try:
-                            self.main_app.vmidi.close(vm)
-                            self.main_app.created_vmidi_ports.discard(vm)
-                        except Exception:
-                            pass
-                print("🧹 Closed all room vmidi ports")
-        except Exception:
-            pass
-
-        # Close main midi input/output if open
-        # Close all MIDI inputs
-        try:
-            for _, inport in self.midi_inputs:
-                try:
-                    inport.close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        # Close all MIDI inputs — πρώτα αποσύνδεσέ τα από τη λίστα, μετά κλείσε
+        _ports = list(self.midi_inputs)
         self.midi_inputs = []
+        self.stream_devices = {}
+        # κλείσιμο με μικρή καθυστέρηση (300ms): δίνει χρόνο στον driver να επιστρέψει τα buffers
+        # και αποφεύγει το σφάλμα midiInUnprepareHeader όταν ο player στέλνει ακόμα δεδομένα
+        def _close_all(ports=_ports):
+            for _sid, _p in ports:
+                print(f"🔌 Closing MIDI input {_sid}")
+                safe_close_port(_p, _sid)
+        QtCore.QTimer.singleShot(300, _close_all)
         try:
             self.main_app.routing_config.clear()
             self.main_app.locked_routes.clear()
             self.main_app.seen_streams.clear()
             self.main_app.stream_meta.clear()
             self.main_app.stream_pretty.clear()
+            self.main_app.stream_portname.clear()
+            self.main_app.room_leader = None
         except Exception:
             pass
         self.main_app.show()
-        try:
-            if getattr(self.main_app, "vmidi", None) and getattr(self, "metronome_port_name", None):
-                self.main_app.vmidi.close(self.metronome_port_name)
-                self.main_app.created_vmidi_ports.discard(self.metronome_port_name)
-                print(f"🧹 Closed metronome port: {self.metronome_port_name}")
-        except Exception as e:
-            print("⚠️ Failed to close metronome port:", e)
+        # (το metronome port μένει ανοιχτό: ανήκει στην εφαρμογή, όχι στο δωμάτιο)
         try:
             for out in getattr(self, "local_output_cache", {}).values():
                 try:
@@ -913,6 +912,10 @@ class RoomWindow(QWidget):
             self.local_output_cache.clear()
         except Exception:
             pass
+        # το main_app να μην κρατά αναφορά στο κλειστό παράθυρο
+        # (αλλιώς το listen_for_rooms συνεχίζει να του δίνει μηνύματα)
+        if getattr(self.main_app, "room_window", None) is self:
+            self.main_app.room_window = None
         self.close()
 
     async def start_webrtc(self):
@@ -939,10 +942,7 @@ class RoomWindow(QWidget):
             except Exception as e:
                 print(f"⚠️ MIDI input disconnected: {stream_id}: {e}")
 
-                try:
-                    inport.close()
-                except Exception:
-                    pass
+                safe_close_port(inport, stream_id)
 
                 lost_dev = self.stream_devices.get(stream_id)
 
@@ -1052,6 +1052,8 @@ class RoomWindow(QWidget):
         dlg.exec_()
 
     def on_midi_message(self, message):
+        if self._left:
+            return
         port_name = None
         try:
             data = json.loads(message)
@@ -1099,32 +1101,26 @@ class RoomWindow(QWidget):
                     # Human label for routing manager (can be long)
                     self.main_app.stream_pretty[key] = f"{sender} — {device} ({stream})"
 
-                    # Actual Windows/FL port name (must be short)
-                    port_name = self.main_app.make_remote_port_name(sender, device, stream)
-                    self.main_app.stream_portname[key] = port_name
-
                     existing = self.main_app.routing_config.get(key, {})
                     existing_port = existing.get("vmidi")
                     port_actually_exists = existing_port in getattr(self.main_app, "created_vmidi_ports", set())
 
                     if not existing_port or not port_actually_exists:
-                        if getattr(self.main_app, "vmidi", None) is None:
-                            print("❌ vmidi bridge not running; cannot create ports.")
+                        # ΔΕΝ δημιουργούμε port εδώ (θα ήταν αόρατο στους αναγνώστες που είναι ήδη
+                        # συνδεδεμένοι στο teVirtualMIDI endpoint). Αναθέτουμε ένα έτοιμο slot του pool.
+                        slot = self.main_app.allocate_vmidi_slot()
+                        if not slot:
+                            print(f"❌ No free virtual MIDI slot for {key} "
+                                  f"(pool size {len(self.main_app.vmidi_pool)}). Αύξησε το VMIDI_POOL_SIZE.")
                             continue
-                        self.main_app.ensure_vmidi_bridge()
-                        ok = self.main_app.vmidi.create(port_name)
-                        if ok:
-                            self.main_app.routing_config[key] = {"vmidi": port_name, "channel": 1}
-                            self.main_app.locked_routes.add(key)
-                            self.main_app.created_vmidi_ports.add(port_name)
-                            self.main_app.debug_dump_midi_ports(f"after create remote {port_name}")
+                        self.main_app.routing_config[key] = {"vmidi": slot, "channel": 1}
+                        self.main_app.locked_routes.add(key)
+                        self.main_app.stream_portname[key] = slot
 
-                            if getattr(self.main_app, "routing_manager_dialog", None):
-                                self.main_app.routing_manager_dialog.refresh_table()
+                        if getattr(self.main_app, "routing_manager_dialog", None):
+                            self.main_app.routing_manager_dialog.refresh_table()
 
-                            print(f"🔒 Auto-created vmidi port for {key}: {port_name}")
-                        else:
-                            print(f"❌ Failed to create vmidi port: {port_name}")
+                        print(f"🔒 Assigned vmidi slot for {key}: {slot}")
                 if getattr(self.main_app, "routing_manager_dialog", None):
                     self.main_app.routing_manager_dialog.refresh_table()
                 return
@@ -1359,14 +1355,9 @@ class RoomWindow(QWidget):
                         self.main_app.stream_meta.pop((u, s), None)
                         self.main_app.stream_portname.pop((u, s), None)
 
+                # τα ports ΔΕΝ κλείνουν: το slot ελευθερώνεται (το route αφαιρέθηκε παραπάνω)
                 for vm in to_close:
-                    try:
-                        if self.main_app.vmidi:
-                            self.main_app.vmidi.close(vm)
-                        self.main_app.created_vmidi_ports.discard(vm)
-                        print(f"🧹 Closed vmidi port (user left): {vm}")
-                    except Exception as e:
-                        print("⚠️ Failed to close vmidi port:", vm, e)
+                    print(f"♻️ vmidi slot released (user left): {vm}")
 
                 if getattr(self.main_app, "routing_manager_dialog", None):
                     self.main_app.routing_manager_dialog.refresh_table()
@@ -1910,10 +1901,7 @@ class RoutingManager(QDialog):
                 to_remove = []
                 for sid, port in list(room_win.midi_inputs):
                     if room_win.stream_devices.get(sid, "").lower() == dev_name.lower():
-                        try:
-                            port.close()
-                        except Exception:
-                            pass
+                        safe_close_port(port, sid)
                         to_remove.append(sid)
 
                 room_win.midi_inputs = [
@@ -2086,6 +2074,8 @@ class MidiUserApp(QMainWindow):
         # ---- virtualMIDI bridge ----
         self.vmidi = None
         self.created_vmidi_ports = set()  # all ports created via bridge (local + remote)
+        self.vmidi_pool = []              # τα remote slots (ports) που δημιουργήθηκαν στην εκκίνηση
+        self.metronome_port_name = None
         self.pid = os.getpid()
         self.routing_config = getattr(self, "routing_config", {})
         self.locked_routes = getattr(self, "locked_routes", set())
@@ -2155,6 +2145,61 @@ class MidiUserApp(QMainWindow):
             print("  OUT:", x)
 
         print("=====================================\n")
+
+    def _create_port_fallback(self, name: str, settle: float = 0.3):
+        """Δημιουργεί port· αν το όνομα υπάρχει ήδη στο σύστημα (π.χ. ανενεργό port από προηγούμενο run
+        που το κρατά ακόμα ένα DAW), δοκιμάζει ένα εναλλακτικό όνομα. Επιστρέφει το όνομα ή None."""
+        suf = self._suffix()
+        for cand in (name, f"{name[:27]}_{suf}"[:31], f"{name[:25]}_{suf}x"[:31]):
+            if self.vmidi.create(cand, settle=settle):
+                return cand
+        return None
+
+    def init_vmidi_pool(self):
+        """
+        Δημιουργεί ΟΛΑ τα virtual ports ΜΙΑ φορά, στην εκκίνηση της εφαρμογής, ΠΡΙΝ ανοίξει
+        οποιαδήποτε MIDI είσοδος και πριν ανοίξει DAW.
+        Λόγος: στα Windows MIDI Services, ports του teVirtualMIDI που δημιουργούνται ενώ υπάρχει ήδη
+        ανοιχτή σύνδεση στο endpoint (π.χ. μια loopMIDI είσοδος ή ένα DAW) ΔΕΝ είναι ορατά σε αυτές
+        τις συνδέσεις και δεν παραδίδουν MIDI.
+        """
+        if getattr(self, "_pool_ready", False):
+            return
+        self.ensure_vmidi_bridge()
+        if not getattr(self, "vmidi", None):
+            print("❌ vmidi bridge not running; cannot create the port pool.")
+            return
+
+        print("🔧 Creating virtual MIDI ports (once, at startup)...")
+        user = self._short_user(self.username or "user", 8)
+        suf = self._suffix()
+
+        met = self._create_port_fallback(f"{self.username}_metronome"[:31])
+        if met:
+            self.metronome_port_name = met
+            self.created_vmidi_ports.add(met)
+            print(f"✅ Metronome port: {met}")
+        else:
+            print("❌ Could not create the metronome port")
+
+        for i in range(1, VMIDI_POOL_SIZE + 1):
+            name = self._create_port_fallback(f"{user}_rx{i}_{suf}"[:31])
+            if name:
+                self.vmidi_pool.append(name)
+                self.created_vmidi_ports.add(name)
+            else:
+                print(f"❌ Could not create pool port #{i}")
+
+        self._pool_ready = True
+        print(f"✅ vmidi pool ready: {self.vmidi_pool}")
+
+    def allocate_vmidi_slot(self):
+        """Επιστρέφει ένα ελεύθερο port του pool (ή None)."""
+        used = {r.get("vmidi") for r in self.routing_config.values()}
+        for name in self.vmidi_pool:
+            if name not in used:
+                return name
+        return None
 
     def ensure_vmidi_bridge(self):
         if getattr(self, "vmidi", None):
@@ -2284,12 +2329,24 @@ class MidiUserApp(QMainWindow):
     async def listen_for_rooms(self):
         while True:
             try:
-                async with websockets.connect(SIGNALING_SERVER) as ws:
+                async with websockets.connect(SIGNALING_SERVER, ping_interval=20, ping_timeout=60) as ws:
                     self.ws = ws
                     await ws.send(json.dumps({
                         "type": "hello",
                         "user": self.username or "Unknown"
                     }))
+
+                    # Αν είμαστε ήδη μέσα σε δωμάτιο (reconnect), ο server μας έχει ξεχάσει
+                    # (το αφαιρεί στο finally). Ξαναμπαίνουμε και ξαναστέλνουμε τα streams.
+                    rw = self.room_window
+                    if rw and not getattr(rw, "_left", False):
+                        print(f"🔁 Reconnected — re-joining room '{rw.room_name}'")
+                        await ws.send(json.dumps({
+                            "type": "join",
+                            "room": rw.room_name,
+                            "user": self.username
+                        }))
+                        QtCore.QTimer.singleShot(500, rw.send_streams_announce)
 
                     async for message in ws:
                         data = json.loads(message)
@@ -2487,6 +2544,25 @@ class SettingsWindow(QMainWindow):
 
 
 if __name__ == "__main__":
+    # ---- crash logging ----
+    # Το PyQt5 τερματίζει ΟΛΗ την εφαρμογή (qFatal) αν ένα slot πετάξει exception.
+    # Με custom excepthook το exception τυπώνεται/γράφεται και η εφαρμογή συνεχίζει.
+    # Το faulthandler γράφει στο αρχείο και τα native crashes (π.χ. μέσα στο rtmidi).
+    import faulthandler, traceback, os as _os
+    _log_dir = _os.path.dirname(_os.path.abspath(__file__))
+    _crash_log = open(_os.path.join(_log_dir, "midirooms_crash.log"), "a")
+    faulthandler.enable(_crash_log)
+
+    def _excepthook(t, v, tb):
+        traceback.print_exception(t, v, tb)
+        try:
+            with open(_os.path.join(_log_dir, "midirooms_error.log"), "a") as f:
+                f.write(f"\n--- {datetime.now()} ---\n")
+                traceback.print_exception(t, v, tb, file=f)
+        except Exception:
+            pass
+    sys.excepthook = _excepthook
+
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
     QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
     import ctypes
@@ -2503,8 +2579,17 @@ if __name__ == "__main__":
     window = MidiUserApp()
     window.username = dlg.username
     window.refresh_username_label()
+    window.init_vmidi_pool()      # δημιουργία ΟΛΩΝ των virtual ports πριν ανοίξει οποιαδήποτε είσοδος
     window.show()
 
     with loop:
         loop.run_forever()
     ctypes.windll.winmm.timeEndPeriod(1)
+
+    # Τερματισμός χωρίς destructors: αν κάποιο MIDI input δεν έκλεισε σωστά (_zombie_ports),
+    # ο destructor του RtMidi θα έκανε διπλό delete και θα κρασάριζε τη διεργασία.
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+    _os._exit(0)

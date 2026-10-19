@@ -141,6 +141,7 @@ def base_name(n):
     return re.sub(r"\s+\d+$", "", (n or "").strip()).lower()
 
 
+PARK_INPUTS_ON_LEAVE = False   # False: κανονικό close() στο Leave (διαγνωστικό τεστ). True: parking αντί για close.
 VMIDI_POOL_SIZE = 4   # πόσα remote virtual ports (streams άλλων χρηστών) δημιουργούνται στην εκκίνηση.
                       # Προσοχή: ΟΛΑ τα ports του teVirtualMIDI (και loopMIDI) είναι ένα endpoint των
                       # Windows MIDI Services και το όριο είναι πιθανόν 16 συνολικά (UMP groups).
@@ -155,6 +156,9 @@ def safe_close_port(port, label=""):
     μένει "connected" και ο destructor ξανατρέχει closePort() => διπλό delete => σιωπηλό crash.
     Άρα αν αποτύχει, κρατάμε το αντικείμενο ζωντανό ώστε να μη γίνει ποτέ destruct.
     """
+    for _k, _v in list(_open_inputs.items()):
+        if _v is port:
+            _open_inputs.pop(_k, None)
     try:
         port.close()
         return True
@@ -162,6 +166,38 @@ def safe_close_port(port, label=""):
         print(f"⚠️ close input {label} failed: {e} — keeping port alive to avoid native crash")
         _zombie_ports.append(port)
         return False
+
+
+_open_inputs = {}   # real_name -> mido input port (μένουν ανοιχτά για όλη τη ζωή της εφαρμογής)
+
+
+def acquire_input(real_name):
+    """Επιστρέφει ανοιχτό input port. Αν η συσκευή έχει ήδη ανοιχτεί στο παρελθόν (π.χ. πριν το
+    προηγούμενο Leave), ξαναχρησιμοποιείται το ίδιο port αντί να ξανανοιχτεί."""
+    from mido import open_input
+    port = _open_inputs.get(real_name)
+    if port is not None:
+        try:
+            port.callback = None            # τέλος "parking": ξανά polling
+            for _ in port.iter_pending():   # πέτα ό,τι μαζεύτηκε όσο ήμασταν εκτός δωματίου
+                pass
+            print(f"♻️ Reusing already-open MIDI input {real_name}")
+            return port
+        except Exception as e:
+            print(f"⚠️ cached input {real_name} unusable ({e}) — reopening")
+            _open_inputs.pop(real_name, None)
+            _zombie_ports.append(port)
+    port = open_input(real_name)
+    _open_inputs[real_name] = port
+    return port
+
+
+def park_input(port):
+    """Αντί για close() στο Leave: το port μένει ανοιχτό, τα μηνύματά του απορρίπτονται."""
+    try:
+        port.callback = lambda msg: None
+    except Exception as e:
+        print(f"⚠️ park_input failed: {e}")
 
 
 def resolve_input(dev_name):
@@ -567,7 +603,7 @@ class RoomWindow(QWidget):
             return None
         try:
             print(f"🎹 Opening MIDI input {real_name}")
-            return open_input(real_name)
+            return acquire_input(real_name)
         except Exception as e:
             print(f"⚠️ Failed opening {dev_name} ({real_name}): {e}")
             return None
@@ -732,7 +768,7 @@ class RoomWindow(QWidget):
         # φαίνεται — προσπάθησε να την ανοίξεις
         try:
             from mido import open_input
-            inport = open_input(real_name)
+            inport = acquire_input(real_name)
 
             stream_id = self.main_app.make_stream_id(dev_name, len(self.midi_inputs) + 1)
             self.midi_inputs.append((stream_id, inport))
@@ -822,6 +858,20 @@ class RoomWindow(QWidget):
             # also send once after a tiny delay as a safety net
             QtCore.QTimer.singleShot(200, self.send_streams_announce)
 
+    def closeEvent(self, event):
+        """Το Χ του παραθύρου του δωματίου = Leave Room. Χωρίς αυτό το παράθυρο έκλεινε αλλά το δωμάτιο
+        έμενε ενεργό (timers, websocket, ports) και η εφαρμογή συνέχιζε να τρέχει χωρίς παράθυρο."""
+        if not self._left:
+            try:
+                self.leave_room()        # κάνει cleanup και ξαναδείχνει το κύριο παράθυρο
+            except Exception as e:
+                print(f"⚠️ leave_room from closeEvent failed: {e}")
+                try:
+                    self.main_app.show()
+                except Exception:
+                    pass
+        event.accept()
+
     def leave_room(self):
         if self._left:
             return          # ήδη έχουμε φύγει (π.χ. kicked + leave)
@@ -886,11 +936,19 @@ class RoomWindow(QWidget):
         self.stream_devices = {}
         # κλείσιμο με μικρή καθυστέρηση (300ms): δίνει χρόνο στον driver να επιστρέψει τα buffers
         # και αποφεύγει το σφάλμα midiInUnprepareHeader όταν ο player στέλνει ακόμα δεδομένα
-        def _close_all(ports=_ports):
-            for _sid, _p in ports:
-                print(f"🔌 Closing MIDI input {_sid}")
-                safe_close_port(_p, _sid)
-        QtCore.QTimer.singleShot(300, _close_all)
+        # Τα MIDI inputs ΔΕΝ κλείνουν στο Leave (το close() στο WinMM/WMS αποτυγχάνει με
+        # midiInUnprepareHeader). Μένουν ανοιχτά "parked" και ξαναχρησιμοποιούνται στο επόμενο join.
+        if PARK_INPUTS_ON_LEAVE:
+            for _sid, _p in _ports:
+                print(f"🅿️ Parking MIDI input {_sid} (kept open)")
+                park_input(_p)
+        else:
+            def _close_all(ports=_ports):
+                for _sid, _p in ports:
+                    print(f"🔌 Closing MIDI input {_sid}")
+                    ok = safe_close_port(_p, _sid)
+                    print(f"   → close {'OK' if ok else 'FAILED'} for {_sid}")
+            QtCore.QTimer.singleShot(300, _close_all)
         try:
             self.main_app.routing_config.clear()
             self.main_app.locked_routes.clear()

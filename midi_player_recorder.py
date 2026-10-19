@@ -31,6 +31,22 @@ from mido import Message, MidiFile, MidiTrack, MetaMessage
 from PyQt5 import QtCore, QtWidgets
 
 
+_zombie_ports = []   # ports που απέτυχαν να κλείσουν: τα κρατάμε ζωντανά (αποφυγή native crash)
+
+
+def safe_close(port, label=""):
+    """Κλείνει ένα mido port. Αν το close() αποτύχει (π.χ. midiInUnprepareHeader στο WinMM),
+    το RtMidi αφήνει το αντικείμενο 'connected' και ο destructor ξανακάνει close => crash.
+    Άρα σε αποτυχία κρατάμε το αντικείμενο ζωντανό και δεν το αφήνουμε να γίνει destruct."""
+    try:
+        port.close()
+        return True
+    except Exception as e:
+        print(f"⚠️ close {label} failed: {e} — keeping port alive to avoid native crash")
+        _zombie_ports.append(port)
+        return False
+
+
 # ============================================================================
 #  MIDI PLAYER — παίζει ένα ή περισσότερα .mid ταυτόχρονα σε ένα output port
 # ============================================================================
@@ -93,7 +109,14 @@ class MidiPlayerTab(QtWidgets.QWidget):
         self.statusLabel.setStyleSheet("color: gray;")
         layout.addWidget(self.statusLabel)
 
+    def _lock_port_selection(self, locked: bool):
+        """Όσο παίζει το αρχείο, η επιλογή θύρας είναι κλειδωμένη (και το Refresh)."""
+        self.portCombo.setEnabled(not locked)
+        self.refreshPortsBtn.setEnabled(not locked)
+
     def refresh_ports(self):
+        if self.playing:
+            return      # ποτέ αλλαγή λίστας/επιλογής όσο παίζει
         self.portCombo.clear()
         try:
             outs = mido.get_output_names()
@@ -170,7 +193,7 @@ class MidiPlayerTab(QtWidgets.QWidget):
 
         if not self.tracks:
             self.statusLabel.setText("⚠️ Κανένα note στα επιλεγμένα αρχεία")
-            self.output_port.close()
+            safe_close(self.output_port, "output")
             self.output_port = None
             return
 
@@ -183,6 +206,7 @@ class MidiPlayerTab(QtWidgets.QWidget):
         self.play_timer.timeout.connect(self._tick)
         self.play_timer.start(1)  # έλεγχος κάθε 1ms
 
+        self._lock_port_selection(True)
         self.playBtn.setEnabled(False)
         self.stopBtn.setEnabled(True)
         self.statusLabel.setText(f"▶️ Παίζει {len(self.tracks)} track(s) — {total_events} events")
@@ -229,11 +253,9 @@ class MidiPlayerTab(QtWidgets.QWidget):
                     self.output_port.send(Message("control_change", channel=ch, control=123, value=0))
             except Exception:
                 pass
-            try:
-                self.output_port.close()
-            except Exception:
-                pass
+            safe_close(self.output_port, "output")
             self.output_port = None
+        self._lock_port_selection(False)
         self.playBtn.setEnabled(True)
         self.stopBtn.setEnabled(False)
         self.statusLabel.setText("⏹️ Σταματημένο")
@@ -291,7 +313,14 @@ class MidiRecorderTab(QtWidgets.QWidget):
 
         layout.addStretch(1)
 
+    def _lock_port_selection(self, locked: bool):
+        """Όσο γίνεται καταγραφή, η επιλογή θύρας είναι κλειδωμένη (και το Refresh)."""
+        self.portCombo.setEnabled(not locked)
+        self.refreshPortsBtn.setEnabled(not locked)
+
     def refresh_ports(self):
+        if self.recording:
+            return      # ποτέ αλλαγή λίστας/επιλογής όσο γίνεται καταγραφή
         self.portCombo.clear()
         try:
             ins = mido.get_input_names()
@@ -321,6 +350,7 @@ class MidiRecorderTab(QtWidgets.QWidget):
         self.poll_timer.timeout.connect(self._poll)
         self.poll_timer.start(1)
 
+        self._lock_port_selection(True)
         self.recordBtn.setEnabled(False)
         self.stopBtn.setEnabled(True)
         self.statusLabel.setText("⏺️ Καταγραφή... (στιγμή 0 = πρώτο μήνυμα)")
@@ -347,11 +377,9 @@ class MidiRecorderTab(QtWidgets.QWidget):
             except Exception:
                 pass
         if self.input_port:
-            try:
-                self.input_port.close()
-            except Exception:
-                pass
+            safe_close(self.input_port, "input")
             self.input_port = None
+        self._lock_port_selection(False)
 
         if not self.recorded:
             self.statusLabel.setText("⚠️ Δεν καταγράφηκε κανένα event")
@@ -410,6 +438,23 @@ class MidiToolWindow(QtWidgets.QMainWindow):
         tabs.addTab(self.player_tab, "🎵 MIDI Player")
         tabs.addTab(self.recorder_tab, "⏺ MIDI Recorder")
         self.setCentralWidget(tabs)
+
+    def closeEvent(self, event):
+        """Κλείσιμο παραθύρου: σταμάτα καθαρά player/recorder πριν βγει η εφαρμογή."""
+        try:
+            if self.player_tab.playing:
+                self.player_tab.stop()
+            rec = self.recorder_tab
+            if rec.recording:
+                rec.recording = False
+                if rec.poll_timer:
+                    rec.poll_timer.stop()
+                if rec.input_port:
+                    safe_close(rec.input_port, "input")
+                    rec.input_port = None
+        except Exception as e:
+            print("⚠️ closeEvent cleanup:", e)
+        event.accept()
 
 
 if __name__ == "__main__":

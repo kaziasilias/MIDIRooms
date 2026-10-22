@@ -71,7 +71,7 @@ async def broadcast_user_list(room):
         usernames.pop(peer, None)
 
 async def websocket_handler(request):
-    ws = web.WebSocketResponse()
+    ws = web.WebSocketResponse(compress=False)  # χωρίς permessage-deflate: λιγότερη καθυστέρηση/CPU ανά μήνυμα
     await ws.prepare(request)
 
     # απενεργοποίηση Nagle algorithm (TCP_NODELAY) για χαμηλό latency

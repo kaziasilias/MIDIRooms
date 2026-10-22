@@ -31,7 +31,48 @@ from mido import Message, MidiFile, MidiTrack, MetaMessage
 from PyQt5 import QtCore, QtWidgets
 
 
+import re
+
+
+def display_name(real_name):
+    """Όνομα θύρας όπως το βλέπει ο χρήστης: χωρίς τον αύξοντα αριθμό που προσθέτει το WinMM/RtMidi
+    (π.χ. 'LoopPort1 2' -> 'LoopPort1'). Το πραγματικό όνομα χρειάζεται μόνο για το άνοιγμα της θύρας."""
+    name = (real_name or "").strip()
+    if name.upper().startswith("_MR_"):
+        # οι θύρες του MIDIRooms έχουν ΔΥΟ αριθμούς στο τέλος ('_MR_0001 4 5'): βγάζουμε όλους
+        return re.sub(r"(\s+\d+)+$", "", name)
+    return re.sub(r"\s+\d+$", "", name)
+
+
+def device_choices(real_names):
+    """Λίστα (όνομα_προς_εμφάνιση, πραγματικό_όνομα). Σε ίδια ονόματα, από το δεύτερο και μετά προστίθεται ' (2)', ' (3)'."""
+    seen = {}
+    out = []
+    for real in real_names:
+        disp = display_name(real)
+        seen[disp] = seen.get(disp, 0) + 1
+        out.append((disp if seen[disp] == 1 else f"{disp} ({seen[disp]})", real))
+    return out
+
+
+def selected_port(combo):
+    """Το πραγματικό όνομα της επιλεγμένης θύρας (όχι αυτό που εμφανίζεται)."""
+    return combo.currentData() or combo.currentText()
+
+
 _zombie_ports = []   # ports που απέτυχαν να κλείσουν: τα κρατάμε ζωντανά (αποφυγή native crash)
+
+
+def file_bpm(path, default=120.0):
+    """BPM του πρώτου set_tempo ενός .mid (αλλιώς 120, που είναι η προεπιλογή του προτύπου)."""
+    try:
+        for track in MidiFile(path).tracks:
+            for m in track:
+                if m.type == "set_tempo":
+                    return round(mido.tempo2bpm(m.tempo), 2)
+    except Exception as e:
+        print("⚠️ file_bpm failed:", e)
+    return default
 
 
 def safe_close(port, label=""):
@@ -123,14 +164,16 @@ class MidiPlayerTab(QtWidgets.QWidget):
         except Exception as e:
             outs = []
             print("⚠️ get_output_names failed:", e)
-        self.portCombo.addItems(outs)
+        for disp, real in device_choices(outs):
+            self.portCombo.addItem(disp, real)
 
     def add_files(self):
         fnames, _ = QtWidgets.QFileDialog.getOpenFileNames(
             self, "Select MIDI files", "", "MIDI Files (*.mid *.midi)"
         )
         for f in fnames:
-            item = QtWidgets.QListWidgetItem(os.path.basename(f))
+            bpm = file_bpm(f)
+            item = QtWidgets.QListWidgetItem(f"{os.path.basename(f)}  ({bpm:g} BPM)")
             item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
             item.setCheckState(QtCore.Qt.Checked)
             item.setData(QtCore.Qt.UserRole, f)  # πλήρες path
@@ -159,7 +202,7 @@ class MidiPlayerTab(QtWidgets.QWidget):
         if self.playing:
             return
 
-        port_name = self.portCombo.currentText()
+        port_name = selected_port(self.portCombo)
         if not port_name:
             self.statusLabel.setText("⚠️ Δεν επιλέχθηκε output port")
             return
@@ -203,6 +246,7 @@ class MidiPlayerTab(QtWidgets.QWidget):
         self.playing = True
 
         self.play_timer = QtCore.QTimer()
+        self.play_timer.setTimerType(QtCore.Qt.PreciseTimer)
         self.play_timer.timeout.connect(self._tick)
         self.play_timer.start(1)  # έλεγχος κάθε 1ms
 
@@ -262,18 +306,18 @@ class MidiPlayerTab(QtWidgets.QWidget):
 
 
 # ============================================================================
-#  MIDI RECORDER — καταγράφει από input port, στιγμή 0 = πρώτο μήνυμα
+#  MIDI RECORDER — καταγράφει από input port (BPM και στιγμή 0 επιλέγονται από τον χρήστη)
 # ============================================================================
 class MidiRecorderTab(QtWidgets.QWidget):
-    RECORD_BPM = 120  # σταθερό tempo αναφοράς για το εξαγόμενο .mid
+    DEFAULT_BPM = 120.0
 
     def __init__(self):
         super().__init__()
         self.input_port = None
         self.poll_timer = None
         self.recording = False
-        self.recorded = []        # λίστα από (abs_time_sec, Message)
-        self.first_msg_time = None
+        self.recorded = []        # λίστα από (abs_time_sec [perf_counter], Message)
+        self.t_press = None       # στιγμή που πατήθηκε το Record
 
         self._build_ui()
         self.refresh_ports()
@@ -291,6 +335,22 @@ class MidiRecorderTab(QtWidgets.QWidget):
         port_row.addWidget(self.refreshPortsBtn)
         port_row.addStretch(1)
         layout.addLayout(port_row)
+
+        opt_row = QtWidgets.QHBoxLayout()
+        opt_row.addWidget(QtWidgets.QLabel("BPM του αρχείου:"))
+        self.bpmSpin = QtWidgets.QDoubleSpinBox()
+        self.bpmSpin.setDecimals(2)
+        self.bpmSpin.setRange(20.0, 400.0)
+        self.bpmSpin.setValue(self.DEFAULT_BPM)
+        opt_row.addWidget(self.bpmSpin)
+        opt_row.addSpacing(20)
+        opt_row.addWidget(QtWidgets.QLabel("Στιγμή 0:"))
+        self.zeroCombo = QtWidgets.QComboBox()
+        self.zeroCombo.addItem("Πάτημα Record", "press")
+        self.zeroCombo.addItem("Πρώτο μήνυμα", "first")
+        opt_row.addWidget(self.zeroCombo)
+        opt_row.addStretch(1)
+        layout.addLayout(opt_row)
 
         ctrl_row = QtWidgets.QHBoxLayout()
         self.recordBtn = QtWidgets.QPushButton("⏺ Record")
@@ -314,9 +374,11 @@ class MidiRecorderTab(QtWidgets.QWidget):
         layout.addStretch(1)
 
     def _lock_port_selection(self, locked: bool):
-        """Όσο γίνεται καταγραφή, η επιλογή θύρας είναι κλειδωμένη (και το Refresh)."""
+        """Όσο γίνεται καταγραφή, η επιλογή θύρας (και οι ρυθμίσεις αρχείου) είναι κλειδωμένες."""
         self.portCombo.setEnabled(not locked)
         self.refreshPortsBtn.setEnabled(not locked)
+        self.bpmSpin.setEnabled(not locked)
+        self.zeroCombo.setEnabled(not locked)
 
     def refresh_ports(self):
         if self.recording:
@@ -327,12 +389,13 @@ class MidiRecorderTab(QtWidgets.QWidget):
         except Exception as e:
             ins = []
             print("⚠️ get_input_names failed:", e)
-        self.portCombo.addItems(ins)
+        for disp, real in device_choices(ins):
+            self.portCombo.addItem(disp, real)
 
     def start_record(self):
         if self.recording:
             return
-        port_name = self.portCombo.currentText()
+        port_name = selected_port(self.portCombo)
         if not port_name:
             self.statusLabel.setText("⚠️ Δεν επιλέχθηκε input port")
             return
@@ -343,17 +406,19 @@ class MidiRecorderTab(QtWidgets.QWidget):
             return
 
         self.recorded = []
-        self.first_msg_time = None
+        self.t_press = time.perf_counter()
         self.recording = True
 
         self.poll_timer = QtCore.QTimer()
+        self.poll_timer.setTimerType(QtCore.Qt.PreciseTimer)
         self.poll_timer.timeout.connect(self._poll)
         self.poll_timer.start(1)
 
         self._lock_port_selection(True)
         self.recordBtn.setEnabled(False)
         self.stopBtn.setEnabled(True)
-        self.statusLabel.setText("⏺️ Καταγραφή... (στιγμή 0 = πρώτο μήνυμα)")
+        zero = "πάτημα Record" if self.zeroCombo.currentData() == "press" else "πρώτο μήνυμα"
+        self.statusLabel.setText(f"⏺️ Καταγραφή... (στιγμή 0 = {zero}, {self.bpmSpin.value():g} BPM)")
 
     def _poll(self):
         if not self.recording or not self.input_port:
@@ -361,12 +426,7 @@ class MidiRecorderTab(QtWidgets.QWidget):
         for msg in self.input_port.iter_pending():
             if msg.is_meta:
                 continue
-            now = time.perf_counter()
-            # στιγμή 0 = πρώτο μήνυμα
-            if self.first_msg_time is None:
-                self.first_msg_time = now
-            rel_time = now - self.first_msg_time
-            self.recorded.append((rel_time, msg))
+            self.recorded.append((time.perf_counter(), msg))
             self.countLabel.setText(f"Events: {len(self.recorded)}")
 
     def stop_record(self):
@@ -403,22 +463,35 @@ class MidiRecorderTab(QtWidgets.QWidget):
         self.stopBtn.setEnabled(False)
 
     def _save_midi(self, path):
-        """Γράφει τα recorded events σε .mid με σταθερό 120 BPM, notes σε πραγματικό χρόνο."""
-        mid = MidiFile()
-        track = MidiTrack()
-        mid.tracks.append(track)
-
+        """Γράφει τα recorded events σε .mid με το BPM του πεδίου. Οι χρόνοι είναι πραγματικοί
+        (δευτερόλεπτα), άρα το BPM καθορίζει μόνο σε ποιο μουσικό πλέγμα (μέτρα/beats) πέφτουν στο DAW."""
+        mid = MidiFile(type=1)
         ticks_per_beat = mid.ticks_per_beat  # default 480
-        tempo = mido.bpm2tempo(self.RECORD_BPM)
-        track.append(MetaMessage("set_tempo", tempo=tempo, time=0))
+        tempo = mido.bpm2tempo(self.bpmSpin.value())
 
-        last_time = 0.0
-        for rel_time, msg in self.recorded:
-            delta_sec = rel_time - last_time
-            last_time = rel_time
-            delta_ticks = int(mido.second2tick(max(0.0, delta_sec), ticks_per_beat, tempo))
-            new_msg = msg.copy(time=delta_ticks)
-            track.append(new_msg)
+        # Track 0: tempo. Έπειτα ΕΝΑ track ανά κανάλι (η δομή κανάλι/όργανο του αρχικού αρχείου)
+        tempo_track = MidiTrack()
+        tempo_track.append(MetaMessage("track_name", name="MIDIRooms", time=0))
+        tempo_track.append(MetaMessage("set_tempo", tempo=tempo, time=0))
+        mid.tracks.append(tempo_track)
+
+        t0 = self.t_press if self.zeroCombo.currentData() == "press" else self.recorded[0][0]
+        by_channel = {}
+        for abs_time, msg in self.recorded:
+            ch = getattr(msg, "channel", None)   # τα sysex/clock δεν έχουν κανάλι
+            by_channel.setdefault(ch, []).append((abs_time, msg))
+
+        for ch in sorted(by_channel, key=lambda c: (c is None, c)):
+            track = MidiTrack()
+            track.append(MetaMessage("track_name", name=("Other" if ch is None else f"Channel {ch + 1}"), time=0))
+            last_ticks = 0
+            for abs_time, msg in by_channel[ch]:
+                rel_time = max(0.0, abs_time - t0)
+                # στρογγυλοποίηση των ΑΠΟΛΥΤΩΝ ticks (όχι του κάθε delta)
+                abs_ticks = max(last_ticks, int(round(mido.second2tick(rel_time, ticks_per_beat, tempo))))
+                track.append(msg.copy(time=abs_ticks - last_ticks))
+                last_ticks = abs_ticks
+            mid.tracks.append(track)
 
         mid.save(path)
 

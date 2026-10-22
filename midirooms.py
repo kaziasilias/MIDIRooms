@@ -141,6 +141,52 @@ def base_name(n):
     return re.sub(r"\s+\d+$", "", (n or "").strip()).lower()
 
 
+# Μηνύματα καναλιού (εκτός από νότες) που αναμεταδίδονται: τύπος -> πεδία payload
+CHANNEL_MSG_FIELDS = {
+    "program_change": ("program",),
+    "control_change": ("control", "value"),
+    "pitchwheel": ("pitch",),
+    "aftertouch": ("value",),
+    "polytouch": ("note", "value"),
+}
+
+# --- Συγχρονισμός / buffer αναπαραγωγής ---------------------------------------------------
+BUFFER_MS = 40             # σταθερό buffer (ms) από τη στιγμή που πατήθηκε η νότα μέχρι να παιχτεί στον παραλήπτη
+BUFFER_MIN_MS = 20          # κάτω όριο του slider
+BUFFER_MAX_MS = 100         # άνω όριο του slider
+ADAPTIVE_BUFFER = True      # leaky max: το buffer ανεβαίνει όταν μια νότα έρθει αργά και χαλαρώνει σιγά-σιγά
+RELAX_MS_PER_S = 10         # πόσα ms/δευτερόλεπτο "χαλαρώνει" το επιπλέον buffer (πρέπει να είναι << 1000)
+MAX_EXTRA_MS = 100          # ανώτατο επιπλέον buffer πάνω από τη βάση
+SYNC_WINDOW = 8            # πόσα sync (×3 s) κοιτάμε για το δείγμα με το μικρότερο RTT
+
+PORT_PREFIX = "_MR_"                      # πρόθεμα των εσωτερικών virtual ports της εφαρμογής
+METRONOME_PORT_NAME = "_MR_METRONOME"     # όνομα του virtual port του metronome
+
+
+def display_name(real_name):
+    """Όνομα συσκευής όπως το βλέπει ο χρήστης στο GUI: χωρίς τον αύξοντα αριθμό που προσθέτει
+    το WinMM/RtMidi στο τέλος (π.χ. 'LoopPort1 2' -> 'LoopPort1'). Το πραγματικό όνομα χρειάζεται
+    μόνο για το άνοιγμα της συσκευής."""
+    return re.sub(r"\s+\d+$", "", (real_name or "").strip())
+
+
+def is_internal_port(name):
+    """True για τα virtual ports της ίδιας της εφαρμογής (_MR_0001, _MR_METRONOME, ...)."""
+    return display_name(name).upper().startswith(PORT_PREFIX)
+
+
+def device_choices(real_names):
+    """Λίστα (όνομα_προς_εμφάνιση, πραγματικό_όνομα). Αν δύο συσκευές έχουν ίδιο όνομα εμφάνισης,
+    μόνο στις επόμενες προστίθεται ' (2)', ' (3)' ώστε να ξεχωρίζουν."""
+    seen = {}
+    out = []
+    for real in real_names:
+        disp = display_name(real)
+        seen[disp] = seen.get(disp, 0) + 1
+        out.append((disp if seen[disp] == 1 else f"{disp} ({seen[disp]})", real))
+    return out
+
+
 PARK_INPUTS_ON_LEAVE = False   # False: κανονικό close() στο Leave (διαγνωστικό τεστ). True: parking αντί για close.
 VMIDI_POOL_SIZE = 4   # πόσα remote virtual ports (streams άλλων χρηστών) δημιουργούνται στην εκκίνηση.
                       # Προσοχή: ΟΛΑ τα ports του teVirtualMIDI (και loopMIDI) είναι ένα endpoint των
@@ -374,6 +420,7 @@ class PianoWidget(QtWidgets.QWidget):
         # containers
         self.white_btns = {}   # note -> QPushButton
         self.black_btns = {}   # note -> QPushButton
+        self._active = set()   # (channel, note) που κρατιούνται αυτή τη στιγμή (από MIDI συσκευές/αρχεία)
 
         # No layout: absolute positioning to overlap blacks over whites
         # ---- place white keys ----
@@ -418,6 +465,30 @@ class PianoWidget(QtWidgets.QWidget):
         if callable(self.on_send_midi):
             self.on_send_midi(note, 0)
         self._highlight(note, False)
+
+    def note_event(self, channel, note, on):
+        """Ανάβει/σβήνει ένα πλήκτρο με βάση τα ΕΝΕΡΓΑ (κανάλι, νότα): το πλήκτρο μένει αναμμένο
+        όσο κρατιέται σε οποιοδήποτε κανάλι και σβήνει όταν δεν κρατιέται πουθενά."""
+        if note is None:
+            return
+        if on:
+            self._active.add((channel, note))
+        else:
+            self._active.discard((channel, note))
+        self._highlight(note, any(n == note for (_, n) in self._active))
+
+    def clear_channel(self, channel):
+        """All Notes Off / All Sound Off ενός καναλιού (CC 123 / 120)."""
+        for (ch, n) in [x for x in self._active if x[0] == channel]:
+            self._active.discard((ch, n))
+            self._highlight(n, any(nn == n for (_, nn) in self._active))
+
+    def clear_all(self):
+        """Σβήνει όλα τα πλήκτρα (Leave, Mute, κλείσιμο)."""
+        notes = {n for (_, n) in self._active}
+        self._active.clear()
+        for n in notes:
+            self._highlight(n, False)
 
     def _highlight(self, note, on):
         # set color back based on key type
@@ -510,6 +581,7 @@ class RoomWindow(QWidget):
         self.logSettingsButton = QtWidgets.QPushButton("Log Settings", self)
         self.ui.horizontalLayout.addWidget(self.logSettingsButton)
         self.logSettingsButton.clicked.connect(self.open_log_settings)
+        self._init_buffer_controls()
         # WebRTC objects
         self.offer_sent = False
         self.pc = None
@@ -616,12 +688,12 @@ class RoomWindow(QWidget):
 
         if getattr(self, "stream_devices", None):
             for stream_id, dev_name in self.stream_devices.items():
-                streams.append({"stream": stream_id, "device": dev_name})
+                streams.append({"stream": stream_id, "device": display_name(dev_name)})
         else:
             selected_inputs = getattr(self.main_app, "selected_inputs", []) or []
             for idx, dev_name in enumerate(selected_inputs, start=1):
                 stream_id = self.main_app.make_stream_id(dev_name, idx)
-                streams.append({"stream": stream_id, "device": dev_name})
+                streams.append({"stream": stream_id, "device": display_name(dev_name)})
 
         self.send_to_room({
             "type": "streams_announce",
@@ -631,22 +703,46 @@ class RoomWindow(QWidget):
         self.log_manager.log("SYSTEM", "📣 Sent streams_announce via TCP")
 
     def bump_velocity_bar(self, username: str, velocity: int):
+        """Peak-hold + ομαλή πτώση. Ανεβαίνει αμέσως στην υψηλότερη velocity που ήρθε και πέφτει
+        σταδιακά, ώστε γρήγορες νότες/συγχορδίες να φαίνονται (πριν, κάθε μήνυμα αντικαθιστούσε το
+        προηγούμενο και πολλά δεν προλάβαιναν να ζωγραφιστούν)."""
         bar = self.user_velocity_bars.get(username)
         if not bar:
             return
+        v = int(velocity or 0)
+        if v <= 0:
+            return          # το note_off / velocity 0 δεν ρίχνει τη μπάρα (αφήνουμε τη φυσική πτώση)
 
-        bar.setValue(int(velocity))
+        if not hasattr(self, "_vel_levels"):
+            self._vel_levels = {}
+        level = max(self._vel_levels.get(username, 0.0), float(v))
+        self._vel_levels[username] = level
+        bar.setValue(int(level))
 
-        t = self.velocity_reset_timers.get(username)
+        t = getattr(self, "_vel_decay_timer", None)
         if t is None:
             t = QtCore.QTimer(self)
-            t.setSingleShot(True)
-            t.timeout.connect(
-                lambda u=username: self.user_velocity_bars.get(u) and self.user_velocity_bars[u].setValue(0))
-            self.velocity_reset_timers[username] = t
+            t.timeout.connect(self._decay_velocity_bars)
+            self._vel_decay_timer = t
+        if not t.isActive():
+            t.start(30)
 
-        # restart the same timer instead of creating new ones
-        t.start(300)
+    def _decay_velocity_bars(self):
+        levels = getattr(self, "_vel_levels", {})
+        alive = False
+        for user in list(levels.keys()):
+            bar = self.user_velocity_bars.get(user)
+            new = levels[user] * 0.82 - 0.5
+            if new <= 0 or not bar:
+                levels.pop(user, None)
+                if bar:
+                    bar.setValue(0)
+                continue
+            levels[user] = new
+            bar.setValue(int(new))
+            alive = True
+        if not alive:
+            self._vel_decay_timer.stop()
 
     def preferred_remote_port(self, user: str, stream: str) -> str | None:
         meta = getattr(self.main_app, "stream_meta", {}).get((user, stream), {})
@@ -695,7 +791,7 @@ class RoomWindow(QWidget):
         for dev_name in new_devices:
             try:
                 def make_stream_id(dev_name: str, idx: int) -> str:
-                    base = "".join(c if c.isalnum() else "_" for c in (dev_name or "device")).strip("_")
+                    base = "".join(c if c.isalnum() else "_" for c in (display_name(dev_name) or "device")).strip("_")
                     base = "_".join(base.split("_"))
                     base = base[:24] if base else f"dev{idx}"
                     return f"{base}_{idx}"
@@ -816,7 +912,13 @@ class RoomWindow(QWidget):
         estimated_local_at_server = t0 + rtt / 2.0
         offset = server_time - estimated_local_at_server
 
-        self.server_clock_offset = offset
+        # Offset από το δείγμα με το ΜΙΚΡΟΤΕΡΟ RTT των τελευταίων SYNC_WINDOW μετρήσεων:
+        # μικρότερο RTT = μικρότερη ασυμμετρία διαδρομής = ακριβέστερη εκτίμηση ρολογιού.
+        samples = getattr(self, "_sync_samples", [])
+        samples.append((rtt, offset))
+        self._sync_samples = samples[-SYNC_WINDOW:]
+        self.server_clock_offset = min(self._sync_samples, key=lambda x: x[0])[1]
+        offset = self.server_clock_offset      # για το log παρακάτω
 
 
         # jitter tracking
@@ -876,6 +978,8 @@ class RoomWindow(QWidget):
         if self._left:
             return          # ήδη έχουμε φύγει (π.χ. kicked + leave)
         self._left = True
+        if hasattr(self, "piano"):
+            self.piano.clear_all()
 
         # σταμάτα ΟΛΑ τα timers πρώτα (προηγουμένως έμεναν ενεργά το
         # remote_playback_timer και το metronome_timer)
@@ -1042,8 +1146,11 @@ class RoomWindow(QWidget):
                     # --- Local visualization ---
                     self.log_manager.log("MY_MIDI", f"{me}/{stream_id}: {msg.type} note={note} vel={velocity}")
                     if hasattr(self, "piano"):
-                        self.piano._highlight(note, velocity > 0)
-                    if not self.local_mute:
+                        # ΜΟΝΟ το note_on με velocity>0 ανάβει. Το note_off μπορεί να έχει velocity>0
+                        # (release velocity) και πρέπει να σβήνει το πλήκτρο.
+                        self.piano.note_event(getattr(msg, "channel", 0), note,
+                                              msg.type == "note_on" and (velocity or 0) > 0)
+                    if not self.local_mute and msg.type == "note_on":
                         self.bump_velocity_bar(me, velocity)
                     if self.local_mute:
                         continue
@@ -1063,6 +1170,7 @@ class RoomWindow(QWidget):
                             "note": note,
                             "velocity": velocity,
                             "type": msg.type,
+                            "channel": getattr(msg, "channel", 0),  # 0..15
                             "room": self.room_name,
                             "tcp_midi": True,  # flag για τον server να το κάνει relay
                         }
@@ -1071,6 +1179,33 @@ class RoomWindow(QWidget):
                         )
                     else:
                         print("⏳ WebSocket not connected, skipping send")
+
+                elif msg.type in CHANNEL_MSG_FIELDS:
+                    # program change / CC / pitch bend / aftertouch: κρατούν το κανάλι και το όργανο
+                    if msg.type == "control_change" and getattr(msg, "control", None) in (120, 123) \
+                            and hasattr(self, "piano"):
+                        self.piano.clear_channel(getattr(msg, "channel", 0))
+                    if getattr(msg, "_from_network", False) or self.local_mute:
+                        continue
+                    params = {f: getattr(msg, f) for f in CHANNEL_MSG_FIELDS[msg.type]}
+                    self.record_midi_event(
+                        user=self.main_app.username, stream=stream_id, msg_type=msg.type,
+                        channel=getattr(msg, "channel", 0), extra=params)
+                    if self.main_app.ws:
+                        self.midi_seq += 1
+                        ev = {
+                            "user": self.main_app.username,
+                            "stream": stream_id,
+                            "seq": self.midi_seq,
+                            "timestamp": time.perf_counter() + self.server_clock_offset,
+                            "type": msg.type,
+                            "channel": getattr(msg, "channel", 0),
+                            "params": params,
+                            "room": self.room_name,
+                            "tcp_midi": True,
+                        }
+                        asyncio.get_event_loop().create_task(
+                            self.main_app.ws.send(json.dumps(ev)))
 
     def assign_leader(self, target_user: str):
         # only current leader can assign
@@ -1157,7 +1292,7 @@ class RoomWindow(QWidget):
                             "room": room
                         }
                     # Human label for routing manager (can be long)
-                    self.main_app.stream_pretty[key] = f"{sender} — {device} ({stream})"
+                    self.main_app.stream_pretty[key] = f"{sender} — {display_name(device)}"
 
                     existing = self.main_app.routing_config.get(key, {})
                     existing_port = existing.get("vmidi")
@@ -1166,12 +1301,12 @@ class RoomWindow(QWidget):
                     if not existing_port or not port_actually_exists:
                         # ΔΕΝ δημιουργούμε port εδώ (θα ήταν αόρατο στους αναγνώστες που είναι ήδη
                         # συνδεδεμένοι στο teVirtualMIDI endpoint). Αναθέτουμε ένα έτοιμο slot του pool.
-                        slot = self.main_app.allocate_vmidi_slot()
+                        slot = self.main_app.allocate_vmidi_slot(key)
                         if not slot:
                             print(f"❌ No free virtual MIDI slot for {key} "
                                   f"(pool size {len(self.main_app.vmidi_pool)}). Αύξησε το VMIDI_POOL_SIZE.")
                             continue
-                        self.main_app.routing_config[key] = {"vmidi": slot, "channel": 1}
+                        self.main_app.routing_config[key] = {"vmidi": slot, "channel": None}
                         self.main_app.locked_routes.add(key)
                         self.main_app.stream_portname[key] = slot
 
@@ -1246,20 +1381,44 @@ class RoomWindow(QWidget):
             note = data.get("note")
             velocity = data.get("velocity")
             msg_type = data.get("type")
+            ch = data.get("channel", 0)
+            try:
+                ch = max(0, min(15, int(ch)))
+            except (TypeError, ValueError):
+                ch = 0
+
+            if msg_type in CHANNEL_MSG_FIELDS:
+                params = data.get("params") or {}
+                self.record_midi_event(user=user, stream=stream, msg_type=msg_type,
+                                       channel=ch, extra=params)
+                sender_ts_server = data.get("timestamp", time.perf_counter())
+                if self.server_clock_offset == 0.0:
+                    sender_ts_local = time.perf_counter()
+                else:
+                    sender_ts_local = sender_ts_server - self.server_clock_offset
+                jitter_s = self.peer_jitter.get("_server", 0.005)
+                play_time = self._compute_play_time(sender_ts_local)
+                self.remote_midi_queue.append({
+                    "play_time": play_time, "user": user, "stream": stream,
+                    "type": msg_type, "channel": ch, "params": params,
+                })
+                self.remote_midi_queue.sort(key=lambda e: e["play_time"])
+                return
+
             self.record_midi_event(
                 user=user,
                 stream=stream,
                 msg_type=msg_type,
                 note=note,
                 velocity=velocity,
-                channel=0
+                channel=ch
             )
 
             # Update velocity bar
             if note is not None:
                 effective_velocity = velocity if velocity is not None else 0
 
-                if velocity is not None:
+                if velocity is not None and msg_type == "note_on":
                     self.bump_velocity_bar(user, velocity)
 
                 sender_ts_server = data.get("timestamp", time.perf_counter())
@@ -1271,9 +1430,7 @@ class RoomWindow(QWidget):
                     sender_ts_local = sender_ts_server - self.server_clock_offset
 
                 jitter_s = self.peer_jitter.get("_server", 0.005)
-                adaptive_delay = max(0.015, 2.5 * jitter_s)
-                play_time = sender_ts_local + adaptive_delay
-                play_time = max(play_time, time.perf_counter() + 0.002)
+                play_time = self._compute_play_time(sender_ts_local)
                 print(f"CALC ts_server={sender_ts_server:.1f} my_offset={self.server_clock_offset:.1f} play_time={play_time:.1f} now={time.perf_counter():.1f} diff={play_time-time.perf_counter():.3f}")
                 is_noteoff = (msg_type == "note_off" or
                               (msg_type == "note_on" and effective_velocity == 0))
@@ -1281,7 +1438,7 @@ class RoomWindow(QWidget):
                 if not hasattr(self, "last_noteon_playtime"):
                     self.last_noteon_playtime = {}
 
-                key_note = (user, stream, note)
+                key_note = (user, stream, ch, note)
 
                 if is_noteoff:
                     # εγγύηση: note_off ΠΟΤΕ πριν το note_on του ίδιου note
@@ -1298,18 +1455,84 @@ class RoomWindow(QWidget):
                     "type": msg_type,
                     "note": note,
                     "velocity": effective_velocity,
+                    "channel": ch,
                 })
 
                 self.remote_midi_queue.sort(key=lambda e: e["play_time"])
             # --- GUI Piano highlight ---
             self.log_manager.log(None, f"{user}/{stream}: {msg_type} note={note} vel={velocity}", peer=user)
             if hasattr(self, "piano"):
-                if velocity is not None and velocity > 0:
+                if msg_type == "note_on" and velocity is not None and velocity > 0:
                     self.piano._highlight(note, True)
                     QtCore.QTimer.singleShot(200, lambda n=note: self.piano._highlight(n, False))
 
         except Exception as e:
             print("❌ Failed to parse MIDI message:", e)
+
+    def _init_buffer_controls(self):
+        """Slider για τη βάση του buffer + checkbox για το adaptive (leaky max)."""
+        self.buffer_base_s = BUFFER_MS / 1000.0
+        self.buffer_extra_s = 0.0
+        self.adaptive_buffer = ADAPTIVE_BUFFER
+        self._extra_last_ts = time.perf_counter()
+
+        self.bufferLabel = QtWidgets.QLabel(f"Buffer: {BUFFER_MS} ms", self)
+        self.bufferLabel.setMinimumWidth(110)
+        self.bufferSlider = QtWidgets.QSlider(QtCore.Qt.Horizontal, self)
+        self.bufferSlider.setRange(BUFFER_MIN_MS, BUFFER_MAX_MS)
+        self.bufferSlider.setValue(BUFFER_MS)
+        self.bufferSlider.setFixedWidth(120)
+        self.bufferSlider.setToolTip("Βάση buffer (ms) από τη στιγμή που πατήθηκε η νότα μέχρι να παιχτεί")
+        self.adaptiveCheck = QtWidgets.QCheckBox("Adaptive", self)
+        self.adaptiveCheck.setChecked(self.adaptive_buffer)
+        self.adaptiveCheck.setToolTip("Όταν μια νότα έρθει αργά, το buffer ανεβαίνει προσωρινά και μετά επιστρέφει αργά στη βάση")
+
+        self.ui.horizontalLayout.addWidget(self.bufferLabel)
+        self.ui.horizontalLayout.addWidget(self.bufferSlider)
+        self.ui.horizontalLayout.addWidget(self.adaptiveCheck)
+
+        self.bufferSlider.valueChanged.connect(self._on_buffer_slider)
+        self.adaptiveCheck.toggled.connect(self._on_adaptive_toggled)
+
+        self.buffer_label_timer = QtCore.QTimer(self)
+        self.buffer_label_timer.timeout.connect(self._refresh_buffer_label)
+        self.buffer_label_timer.start(500)
+
+    def _on_buffer_slider(self, value):
+        self.buffer_base_s = value / 1000.0
+        self._refresh_buffer_label()
+
+    def _on_adaptive_toggled(self, checked):
+        self.adaptive_buffer = bool(checked)
+        if not checked:
+            self.buffer_extra_s = 0.0
+        self._refresh_buffer_label()
+
+    def _refresh_buffer_label(self):
+        base = int(round(self.buffer_base_s * 1000))
+        extra = int(round(self.buffer_extra_s * 1000))
+        self.bufferLabel.setText(f"Buffer: {base} ms" + (f" (+{extra})" if extra > 0 else ""))
+
+    def _compute_play_time(self, sender_ts_local):
+        """Υπολογίζει το play_time: βάση + επιπλέον buffer (leaky max).
+        Αν η νότα έρθει αργά, το επιπλέον buffer ανεβαίνει όσο χρειάζεται ώστε οι επόμενες
+        να προλαβαίνουν· όταν δεν υπάρχουν αργές νότες, χαλαρώνει με RELAX_MS_PER_S ms/s."""
+        now = time.perf_counter()
+        dt = max(0.0, now - self._extra_last_ts)
+        self._extra_last_ts = now
+
+        if not self.adaptive_buffer or self.server_clock_offset == 0.0:
+            # χωρίς adaptive (ή χωρίς ολοκληρωμένο clock sync): μόνο η βάση
+            return max(sender_ts_local + self.buffer_base_s, now + 0.002)
+
+        self.buffer_extra_s = max(0.0, self.buffer_extra_s - (RELAX_MS_PER_S / 1000.0) * dt)
+        play_time = sender_ts_local + self.buffer_base_s + self.buffer_extra_s
+
+        if play_time < now + 0.002:                       # ήρθε αργά
+            needed = (now + 0.002) - (sender_ts_local + self.buffer_base_s)
+            self.buffer_extra_s = min(MAX_EXTRA_MS / 1000.0, max(self.buffer_extra_s, needed))
+            play_time = max(sender_ts_local + self.buffer_base_s + self.buffer_extra_s, now + 0.002)
+        return play_time
 
     def process_remote_midi_queue(self):
         if not self.remote_midi_queue:
@@ -1331,19 +1554,19 @@ class RoomWindow(QWidget):
             user = event["user"]
             stream = event["stream"]
             msg_type = event["type"]
-            note = event["note"]
-            velocity = event["velocity"]
-
             try:
-                msg = Message(msg_type, note=note, velocity=velocity)
+                if "params" in event:
+                    msg = Message(msg_type, **event["params"])
+                else:
+                    msg = Message(msg_type, note=event["note"], velocity=event["velocity"])
 
                 route = self.main_app.routing_config.get((user, stream))
                 vmidi_name = None
-                channel = 1
+                forced = None          # None = κράτα το αρχικό κανάλι του αποστολέα
                 if route:
                     vmidi_name = route.get("vmidi")
-                    channel = route.get("channel", 1)
-                msg.channel = (int(channel) - 1) if channel else 0
+                    forced = route.get("channel")
+                msg.channel = (int(forced) - 1) if forced else event.get("channel", 0)
 
                 if vmidi_name and getattr(self.main_app, "vmidi", None):
                     b = msg.bytes()
@@ -1397,6 +1620,7 @@ class RoomWindow(QWidget):
 
                 # Also clean up velocity + latency bars
                 self.user_velocity_bars.pop(username, None)
+                getattr(self, "_vel_levels", {}).pop(username, None)
                 self.user_latency_labels.pop(username, None)
                 # Close any vmidi ports that belonged to this user
                 to_close = []
@@ -1549,6 +1773,8 @@ class RoomWindow(QWidget):
 
     def toggle_local_mute(self):
         self.local_mute = not self.local_mute
+        if self.local_mute and hasattr(self, "piano"):
+            self.piano.clear_all()
         state = "🔇 Muted" if self.local_mute else "🔊 Active"
         self.ui.muteButton.setText(f"Mute Local ({state})")
         print(f"[RoomWindow] Local mute set to {self.local_mute}")
@@ -1707,13 +1933,17 @@ class RoomWindow(QWidget):
 
             delta_ticks = int(mido.second2tick(delta_seconds, ticks_per_beat, tempo))
 
-            msg = Message(
-                event["type"],
-                note=event["note"],
-                velocity=event["velocity"],
-                channel=event.get("channel", 0),
-                time=max(0, delta_ticks)
-            )
+            if event.get("extra") is not None:
+                msg = Message(event["type"], channel=event.get("channel", 0),
+                              time=max(0, delta_ticks), **event["extra"])
+            else:
+                msg = Message(
+                    event["type"],
+                    note=event["note"],
+                    velocity=event["velocity"],
+                    channel=event.get("channel", 0),
+                    time=max(0, delta_ticks)
+                )
 
             track.append(msg)
 
@@ -1726,7 +1956,7 @@ class RoomWindow(QWidget):
             f"Recording saved locally as:\n{filename}"
         )
 
-    def record_midi_event(self, user, stream, msg_type, note, velocity, channel=0):
+    def record_midi_event(self, user, stream, msg_type, note=None, velocity=None, channel=0, extra=None):
         if not getattr(self, "recording", False):
             return
 
@@ -1734,7 +1964,7 @@ class RoomWindow(QWidget):
         if stream == "metronome" or user == "metronome":
             return
 
-        if note is None or velocity is None:
+        if extra is None and (note is None or velocity is None):
             return
 
         now = time.time()
@@ -1747,7 +1977,8 @@ class RoomWindow(QWidget):
             "type": msg_type,
             "note": note,
             "velocity": velocity,
-            "channel": channel
+            "channel": channel,
+            "extra": extra
         })
 
 class RoutingManager(QDialog):
@@ -1822,6 +2053,8 @@ class RoutingManager(QDialog):
         ) or "").lower()
 
         def is_vmidi_or_metronome(name: str) -> bool:
+            if is_internal_port(name):
+                return True
             n = name.lower()
             # exact match με created ports
             if n in vmidi_ports_lower:
@@ -1838,8 +2071,9 @@ class RoutingManager(QDialog):
         physical_inputs = [n for n in all_inputs if not is_vmidi_or_metronome(n)]
 
         selected = set(getattr(self.main_app, "selected_inputs", []) or [])
+        selected_bases = {base_name(x) for x in selected}
 
-        for dev_name in physical_inputs:
+        for disp_name, dev_name in device_choices(physical_inputs):
             row = table.rowCount()
             table.insertRow(row)
 
@@ -1849,7 +2083,8 @@ class RoutingManager(QDialog):
             table.setItem(row, 0, item_type)
 
             # Col 1: Device name
-            item_dev = QtWidgets.QTableWidgetItem(dev_name)
+            item_dev = QtWidgets.QTableWidgetItem(disp_name)
+            item_dev.setData(QtCore.Qt.UserRole, dev_name)
             item_dev.setFlags(item_dev.flags() & ~QtCore.Qt.ItemIsEditable)
             table.setItem(row, 1, item_dev)
 
@@ -1872,7 +2107,7 @@ class RoutingManager(QDialog):
             # Col 4: Active checkbox
             chk = QtWidgets.QCheckBox()
             chk.blockSignals(True)  # μην πυροδοτείς signal κατά το setChecked
-            chk.setChecked(dev_name in selected)
+            chk.setChecked(dev_name in selected or base_name(dev_name) in selected_bases)
             chk.blockSignals(False)  # ξαναενεργοποίησε τα signals
             chk.stateChanged.connect(lambda state, d=dev_name: self.toggle_local_device(d, state))
             cell_widget = QtWidgets.QWidget()
@@ -2141,6 +2376,7 @@ class MidiUserApp(QMainWindow):
         self.stream_meta = getattr(self, "stream_meta", {})
         self.stream_pretty = getattr(self, "stream_pretty", {})
         self.stream_portname = getattr(self, "stream_portname", {})
+        self.sticky_slots = {}            # (χρήστης, stream) -> όνομα slot που πήρε την τελευταία φορά
         self.ensure_vmidi_bridge()
         self.instance_suffix = f"{os.getpid() % 100:02d}"
 
@@ -2229,10 +2465,7 @@ class MidiUserApp(QMainWindow):
             return
 
         print("🔧 Creating virtual MIDI ports (once, at startup)...")
-        user = self._short_user(self.username or "user", 8)
-        suf = self._suffix()
-
-        met = self._create_port_fallback(f"{self.username}_metronome"[:31])
+        met = self._create_port_fallback(METRONOME_PORT_NAME)
         if met:
             self.metronome_port_name = met
             self.created_vmidi_ports.add(met)
@@ -2241,7 +2474,7 @@ class MidiUserApp(QMainWindow):
             print("❌ Could not create the metronome port")
 
         for i in range(1, VMIDI_POOL_SIZE + 1):
-            name = self._create_port_fallback(f"{user}_rx{i}_{suf}"[:31])
+            name = self._create_port_fallback(f"{PORT_PREFIX}{i:04d}")
             if name:
                 self.vmidi_pool.append(name)
                 self.created_vmidi_ports.add(name)
@@ -2249,15 +2482,60 @@ class MidiUserApp(QMainWindow):
                 print(f"❌ Could not create pool port #{i}")
 
         self._pool_ready = True
+        self._load_sticky()
         print(f"✅ vmidi pool ready: {self.vmidi_pool}")
 
-    def allocate_vmidi_slot(self):
-        """Επιστρέφει ένα ελεύθερο port του pool (ή None)."""
+    STICKY_FILE = "sticky_ports.json"
+
+    def _sticky_path(self):
+        import os
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), self.STICKY_FILE)
+
+    def _load_sticky(self):
+        """Φορτώνει τις προηγούμενες αντιστοιχίσεις (χρήστης, stream) -> slot, αν υπάρχουν."""
+        try:
+            with open(self._sticky_path(), "r", encoding="utf-8") as f:
+                rows = json.load(f)
+            self.sticky_slots = {(u, st): slot for u, st, slot in rows if slot in self.vmidi_pool}
+            if self.sticky_slots:
+                print(f"📌 Sticky ports loaded: {self.sticky_slots}")
+        except FileNotFoundError:
+            self.sticky_slots = {}
+        except Exception as e:
+            print("⚠️ sticky ports load failed:", e)
+            self.sticky_slots = {}
+
+    def _save_sticky(self):
+        try:
+            rows = [[u, st, slot] for (u, st), slot in self.sticky_slots.items()]
+            with open(self._sticky_path(), "w", encoding="utf-8") as f:
+                json.dump(rows, f, ensure_ascii=False)
+        except Exception as e:
+            print("⚠️ sticky ports save failed:", e)
+
+    def allocate_vmidi_slot(self, key=None):
+        """Επιστρέφει ένα ελεύθερο port του pool (ή None).
+        Με key=(χρήστης, stream): αν αυτή η συσκευή είχε πάρει ξανά slot και είναι ελεύθερο, παίρνει το ίδιο.
+        Αλλιώς προτιμάται slot που δεν είναι δεσμευμένο για κάποιον άλλον (ώστε να μη χαθεί η θύρα
+        ενός χρήστη που λείπει προσωρινά)."""
         used = {r.get("vmidi") for r in self.routing_config.values()}
-        for name in self.vmidi_pool:
-            if name not in used:
-                return name
-        return None
+        sticky = getattr(self, "sticky_slots", {})
+
+        if key is not None:
+            preferred = sticky.get(key)
+            if preferred in self.vmidi_pool and preferred not in used:
+                return preferred
+
+        reserved = {slot for k, slot in sticky.items() if k != key}
+        free = [n for n in self.vmidi_pool if n not in used]
+        choice = next((n for n in free if n not in reserved), None) or (free[0] if free else None)
+
+        if choice and key is not None:
+            for k in [k for k, v in sticky.items() if v == choice and k != key]:
+                sticky.pop(k)          # το slot ξαναχρησιμοποιείται: η παλιά δέσμευση ακυρώνεται
+            sticky[key] = choice
+            self._save_sticky()
+        return choice
 
     def ensure_vmidi_bridge(self):
         if getattr(self, "vmidi", None):
@@ -2329,7 +2607,7 @@ class MidiUserApp(QMainWindow):
         return f"{user}_{dev}_{i}_{suf}"[:31]
 
     def make_stream_id(self, dev_name: str, idx: int) -> str:
-        base = "".join(c if c.isalnum() else "_" for c in (dev_name or "device")).strip("_")
+        base = "".join(c if c.isalnum() else "_" for c in (display_name(dev_name) or "device")).strip("_")
         base = "_".join(base.split("_"))
         base = base[:24] if base else f"dev{idx}"
         return f"{base}_{idx}"
@@ -2387,7 +2665,7 @@ class MidiUserApp(QMainWindow):
     async def listen_for_rooms(self):
         while True:
             try:
-                async with websockets.connect(SIGNALING_SERVER, ping_interval=20, ping_timeout=60) as ws:
+                async with websockets.connect(SIGNALING_SERVER, ping_interval=20, ping_timeout=60, compression=None) as ws:
                     self.ws = ws
                     await ws.send(json.dumps({
                         "type": "hello",
@@ -2561,15 +2839,20 @@ class SettingsWindow(QMainWindow):
         # Only show REAL inputs (exclude our created ports)
         input_names = [
             n for n in mido.get_input_names()
-            if n not in created and not n.lower().startswith("midirooms.")
+            if n not in created
+            and not is_internal_port(n)
+            and not n.lower().startswith("midirooms.")
         ]
 
-        selected_inputs = getattr(self.main_app, "selected_inputs", [])
+        selected_inputs = getattr(self.main_app, "selected_inputs", []) or []
+        selected_bases = {base_name(x) for x in selected_inputs}
 
-        for name in input_names:
-            item = QtWidgets.QListWidgetItem(name)
+        for disp_name, name in device_choices(input_names):
+            item = QtWidgets.QListWidgetItem(disp_name)
+            item.setData(QtCore.Qt.UserRole, name)     # πραγματικό όνομα (για το άνοιγμα της συσκευής)
             item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
-            item.setCheckState(QtCore.Qt.Checked if name in selected_inputs else QtCore.Qt.Unchecked)
+            checked = name in selected_inputs or base_name(name) in selected_bases
+            item.setCheckState(QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked)
             self.ui.inputsList.addItem(item)
 
     def showEvent(self, event):
@@ -2583,7 +2866,7 @@ class SettingsWindow(QMainWindow):
         for i in range(self.ui.inputsList.count()):
             item = self.ui.inputsList.item(i)
             if item.checkState() == QtCore.Qt.Checked:
-                selected.append(item.text())
+                selected.append(item.data(QtCore.Qt.UserRole) or item.text())
         return selected
 
     def apply_settings(self):
@@ -2596,7 +2879,7 @@ class SettingsWindow(QMainWindow):
             QMessageBox.information(
                 self,
                 "MIDI Settings Applied",
-                f"Inputs: {selected_inputs}\nLocal DAW monitoring should use the physical MIDI input directly."
+                f"Inputs: {[display_name(n) for n in selected_inputs]}\nLocal DAW monitoring should use the physical MIDI input directly."
             )
         self.close()
 

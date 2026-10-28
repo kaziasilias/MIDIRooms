@@ -2542,7 +2542,9 @@ class MidiUserApp(QMainWindow):
             return
         try:
             import os
-            exe_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "midiroomsports.exe")
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            wms_exe = os.path.join(base_dir, "wms", "midiroomsports_wms.exe")
+            exe_path = wms_exe if os.path.exists(wms_exe) else os.path.join(base_dir, "midiroomsports.exe")
             print("DEBUG helper exe path:", exe_path)
             self.vmidi = VirtualMidiBridge(exe_path)
             print("✅ vmidi bridge started")

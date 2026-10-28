@@ -1,0 +1,67 @@
+{
+  "runtimeTarget": {
+    "name": ".NETCoreApp,Version=v10.0",
+    "signature": ""
+  },
+  "compilationOptions": {},
+  "targets": {
+    ".NETCoreApp,Version=v10.0": {
+      "midiroomsports_wms/1.0.0": {
+        "dependencies": {
+          "Microsoft.Windows.Devices.Midi2": "1.0.17-rc.4.25",
+          "runtimepack.Microsoft.Windows.SDK.NET.Ref": "10.0.26100.57"
+        },
+        "runtime": {
+          "midiroomsports_wms.dll": {}
+        }
+      },
+      "runtimepack.Microsoft.Windows.SDK.NET.Ref/10.0.26100.57": {
+        "runtime": {
+          "Microsoft.Windows.SDK.NET.dll": {
+            "assemblyVersion": "10.0.26100.38",
+            "fileVersion": "10.0.26100.55"
+          },
+          "WinRT.Runtime.dll": {
+            "assemblyVersion": "2.2.0.0",
+            "fileVersion": "2.2.0.48161"
+          }
+        }
+      },
+      "Microsoft.Windows.Devices.Midi2/1.0.17-rc.4.25": {
+        "runtimeTargets": {
+          "runtimes/win-arm64/lib/net10.0/Microsoft.Windows.Devices.Midi2.NetProjection.dll": {
+            "rid": "win-arm64",
+            "assetType": "runtime",
+            "assemblyVersion": "1.0.17.25",
+            "fileVersion": "1.0.17.25"
+          },
+          "runtimes/win-x64/lib/net10.0/Microsoft.Windows.Devices.Midi2.NetProjection.dll": {
+            "rid": "win-x64",
+            "assetType": "runtime",
+            "assemblyVersion": "1.0.17.25",
+            "fileVersion": "1.0.17.25"
+          }
+        }
+      }
+    }
+  },
+  "libraries": {
+    "midiroomsports_wms/1.0.0": {
+      "type": "project",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "runtimepack.Microsoft.Windows.SDK.NET.Ref/10.0.26100.57": {
+      "type": "runtimepack",
+      "serviceable": false,
+      "sha512": ""
+    },
+    "Microsoft.Windows.Devices.Midi2/1.0.17-rc.4.25": {
+      "type": "package",
+      "serviceable": true,
+      "sha512": "sha512-veFnyRVsrTsOdW9jpybacE6QRV3zsco1MEae8ivZ2Im1ftZKZMXFIB4Gf2JAcx842vTg2R4sYKGG8Dbx5HpZdg==",
+      "path": "microsoft.windows.devices.midi2/1.0.17-rc.4.25",
+      "hashPath": "microsoft.windows.devices.midi2.1.0.17-rc.4.25.nupkg.sha512"
+    }
+  }
+}

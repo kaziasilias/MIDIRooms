@@ -215,3 +215,4 @@ wms_helper/bin/
 wms_helper/obj/
 sticky_ports.json
 *.mid
+*.pdb

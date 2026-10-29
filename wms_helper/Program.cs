@@ -9,7 +9,7 @@ using Microsoft.Windows.Devices.Midi2;
 using Microsoft.Windows.Devices.Midi2.Messages;
 using Microsoft.Windows.Devices.Midi2.Endpoints.Loopback;
 
-const string TxSuffix = " (tx)";
+const string TxSuffix = " (app-only)";
 const int MaxName = 31; // WinMM port name limit
 
 var logPath = Path.Combine(AppContext.BaseDirectory, "midiroomsports_wms.log");

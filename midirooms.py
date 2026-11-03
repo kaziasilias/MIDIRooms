@@ -50,7 +50,7 @@ class LogManager:
 
         # δυναμικές κατηγορίες ανά peer: "PEER:<username>"
         self.peer_routing = {}  # username -> {"cmd":bool,"room":bool,"file":bool}
-
+        self.peer_listener = None  # καλείται όταν προστίθεται/αφαιρείται peer
         # CSV file
         self.csv_file = None
         self.csv_writer = None
@@ -60,9 +60,12 @@ class LogManager:
     def ensure_peer(self, username):
         if username not in self.peer_routing:
             self.peer_routing[username] = {"cmd": True, "room": True, "file": False}
+            if self.peer_listener:
+                self.peer_listener()
 
     def remove_peer(self, username):
-        self.peer_routing.pop(username, None)
+        if self.peer_routing.pop(username, None) is not None and self.peer_listener:
+            self.peer_listener()
 
     # ---- CSV file control ----
     def start_file(self, filepath):
@@ -152,7 +155,7 @@ CHANNEL_MSG_FIELDS = {
 
 # --- Συγχρονισμός / buffer αναπαραγωγής ---------------------------------------------------
 BUFFER_MS = 40             # σταθερό buffer (ms) από τη στιγμή που πατήθηκε η νότα μέχρι να παιχτεί στον παραλήπτη
-BUFFER_MIN_MS = 20          # κάτω όριο του slider
+BUFFER_MIN_MS = 0         # κάτω όριο του slider
 BUFFER_MAX_MS = 100         # άνω όριο του slider
 ADAPTIVE_BUFFER = True      # leaky max: το buffer ανεβαίνει όταν μια νότα έρθει αργά και χαλαρώνει σιγά-σιγά
 RELAX_MS_PER_S = 10         # πόσα ms/δευτερόλεπτο "χαλαρώνει" το επιπλέον buffer (πρέπει να είναι << 1000)
@@ -161,7 +164,7 @@ SYNC_WINDOW = 8            # πόσα sync (×3 s) κοιτάμε για το δ
 
 PORT_PREFIX = "_MR_"                      # πρόθεμα των εσωτερικών virtual ports της εφαρμογής
 METRONOME_PORT_NAME = "_MR_METRONOME"     # όνομα του virtual port του metronome
-
+PORT_BASE_MAX = 25   # 31 (όριο WinMM) - len(" (DAW)")
 
 def display_name(real_name):
     """Όνομα συσκευής όπως το βλέπει ο χρήστης στο GUI: χωρίς τον αύξοντα αριθμό που προσθέτει
@@ -188,7 +191,7 @@ def device_choices(real_names):
 
 
 PARK_INPUTS_ON_LEAVE = False   # False: κανονικό close() στο Leave (διαγνωστικό τεστ). True: parking αντί για close.
-VMIDI_POOL_SIZE = 4   # πόσα remote virtual ports (streams άλλων χρηστών) δημιουργούνται στην εκκίνηση.
+VMIDI_POOL_SIZE = 0   # πόσα remote virtual ports (streams άλλων χρηστών) δημιουργούνται στην εκκίνηση.
                       # Προσοχή: ΟΛΑ τα ports του teVirtualMIDI (και loopMIDI) είναι ένα endpoint των
                       # Windows MIDI Services και το όριο είναι πιθανόν 16 συνολικά (UMP groups).
                       # Για 2 instances στο ίδιο laptop βάλε 4.
@@ -259,9 +262,9 @@ def resolve_input(dev_name):
 
 
 class VirtualMidiBridge:
-    def __init__(self, exe_path: str):
+    def __init__(self, exe_path: str, extra_args=()):
         self.p = subprocess.Popen(
-            [exe_path],
+            [exe_path, *extra_args],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -1031,9 +1034,6 @@ class RoomWindow(QWidget):
             pass
         # Τα virtual ports ΔΕΝ κλείνουν στο Leave: ανήκουν στο pool της εφαρμογής και
         # μένουν ανοιχτά μέχρι να κλείσει η εφαρμογή (routing_config.clear() παρακάτω
-        # ελευθερώνει τα slots).
-        print("♻️ vmidi ports kept (slots released)")
-
         # Close all MIDI inputs — πρώτα αποσύνδεσέ τα από τη λίστα, μετά κλείσε
         _ports = list(self.midi_inputs)
         self.midi_inputs = []
@@ -1053,6 +1053,12 @@ class RoomWindow(QWidget):
                     ok = safe_close_port(_p, _sid)
                     print(f"   → close {'OK' if ok else 'FAILED'} for {_sid}")
             QtCore.QTimer.singleShot(300, _close_all)
+        # κλείσε τα ports όλων των απομακρυσμένων streams πριν καθαριστεί το routing
+        try:
+            for key in list(self.main_app.routing_config):
+                self._drop_remote_stream(key)
+        except Exception as e:
+            print("⚠️ closing remote ports on leave failed:", e)
         try:
             self.main_app.routing_config.clear()
             self.main_app.locked_routes.clear()
@@ -1279,43 +1285,36 @@ class RoomWindow(QWidget):
                 if not sender or sender == self.main_app.username:
                     return
 
-                for s in streams:
-                    stream = s.get("stream", "kbd1")
-                    device = s.get("device", "Unknown Device")
+                app = self.main_app
+                announced = {s.get("stream", "kbd1"): s.get("device", "Unknown Device") for s in streams}
+
+                # 1) streams που αφαιρέθηκαν ή άλλαξαν συσκευή → κλείνει το ζεύγος
+                for key in [k for k in list(app.routing_config) if k[0] == sender]:
+                    old_dev = app.stream_meta.get(key, {}).get("device")
+                    if key[1] not in announced or announced[key[1]] != old_dev:
+                        self._drop_remote_stream(key)
+
+                # 2) νέα streams → ανοίγει ζεύγος
+                for stream, device in announced.items():
                     key = (sender, stream)
-                    if hasattr(self.main_app, "seen_streams"):
-                        self.main_app.seen_streams.add(key)
-                    # Store metadata for routing manager (optional but recommended)
-                    if hasattr(self.main_app, "stream_meta"):
-                        self.main_app.stream_meta[key] = {
-                            "device": device,
-                            "room": room
-                        }
-                    # Human label for routing manager (can be long)
-                    self.main_app.stream_pretty[key] = f"{sender} — {display_name(device)}"
+                    app.seen_streams.add(key)
+                    app.stream_meta[key] = {"device": device, "room": room}
+                    app.stream_pretty[key] = f"{sender} — {display_name(device)}"
 
-                    existing = self.main_app.routing_config.get(key, {})
-                    existing_port = existing.get("vmidi")
-                    port_actually_exists = existing_port in getattr(self.main_app, "created_vmidi_ports", set())
+                    if app.routing_config.get(key, {}).get("vmidi"):
+                        continue  # υπάρχει ήδη port
 
-                    if not existing_port or not port_actually_exists:
-                        # ΔΕΝ δημιουργούμε port εδώ (θα ήταν αόρατο στους αναγνώστες που είναι ήδη
-                        # συνδεδεμένοι στο teVirtualMIDI endpoint). Αναθέτουμε ένα έτοιμο slot του pool.
-                        slot = self.main_app.allocate_vmidi_slot(key)
-                        if not slot:
-                            print(f"❌ No free virtual MIDI slot for {key} "
-                                  f"(pool size {len(self.main_app.vmidi_pool)}). Αύξησε το VMIDI_POOL_SIZE.")
-                            continue
-                        self.main_app.routing_config[key] = {"vmidi": slot, "channel": None}
-                        self.main_app.locked_routes.add(key)
-                        self.main_app.stream_portname[key] = slot
+                    name = app.open_remote_port(key, device)
+                    if not name:
+                        print(f"❌ Could not create virtual port for {key}")
+                        continue
+                    app.routing_config[key] = {"vmidi": name, "channel": None}
+                    app.locked_routes.add(key)
+                    app.stream_portname[key] = name
+                    print(f"🔒 Opened port for {key}: {name}")
 
-                        if getattr(self.main_app, "routing_manager_dialog", None):
-                            self.main_app.routing_manager_dialog.refresh_table()
-
-                        print(f"🔒 Assigned vmidi slot for {key}: {slot}")
-                if getattr(self.main_app, "routing_manager_dialog", None):
-                    self.main_app.routing_manager_dialog.refresh_table()
+                if getattr(app, "routing_manager_dialog", None):
+                    app.routing_manager_dialog.refresh_table()
                 return
 
             # --- Handle ping/pong control ---
@@ -1599,6 +1598,16 @@ class RoomWindow(QWidget):
         asyncio.get_event_loop().create_task(
             self.main_app.ws.send(json.dumps(midi_event))
         )
+    def _drop_remote_stream(self, key):
+        app = self.main_app
+        route = app.routing_config.pop(key, None)
+        if route:
+            app.close_remote_port(route.get("vmidi"))
+        app.seen_streams.discard(key)
+        app.locked_routes.discard(key)
+        app.stream_pretty.pop(key, None)
+        app.stream_meta.pop(key, None)
+        app.stream_portname.pop(key, None)
     def update_user_list(self, users):
         """Synchronize UI with the current list of connected users."""
         self.connected_users = users
@@ -1617,29 +1626,18 @@ class RoomWindow(QWidget):
                 container = self.user_ui_elements.pop(username)
                 container.setParent(None)
                 container.deleteLater()
-
+                if hasattr(self, "log_manager"):
+                    self.log_manager.remove_peer(username)
                 # Also clean up velocity + latency bars
                 self.user_velocity_bars.pop(username, None)
                 getattr(self, "_vel_levels", {}).pop(username, None)
                 self.user_latency_labels.pop(username, None)
-                # Close any vmidi ports that belonged to this user
-                to_close = []
-                for (u, s), route in list(self.main_app.routing_config.items()):
-                    if u == username:
-                        vm = route.get("vmidi")
-                        if vm:
-                            to_close.append(vm)
-                        # remove route + discovered stream
-                        self.main_app.routing_config.pop((u, s), None)
-                        self.main_app.seen_streams.discard((u, s))
-                        self.main_app.locked_routes.discard((u, s))
-                        self.main_app.stream_pretty.pop((u, s), None)
-                        self.main_app.stream_meta.pop((u, s), None)
-                        self.main_app.stream_portname.pop((u, s), None)
-
-                # τα ports ΔΕΝ κλείνουν: το slot ελευθερώνεται (το route αφαιρέθηκε παραπάνω)
-                for vm in to_close:
-                    print(f"♻️ vmidi slot released (user left): {vm}")
+                # κλείσε όλα τα ports που ανήκαν σε αυτόν τον χρήστη
+                for key in [k for k in list(self.main_app.routing_config) if k[0] == username]:
+                    self._drop_remote_stream(key)
+                # streams που είχε ανακοινώσει αλλά δεν είχαν ακόμα route
+                for key in [k for k in list(self.main_app.seen_streams) if k[0] == username]:
+                    self._drop_remote_stream(key)
 
                 if getattr(self.main_app, "routing_manager_dialog", None):
                     self.main_app.routing_manager_dialog.refresh_table()
@@ -1989,24 +1987,19 @@ class RoutingManager(QDialog):
         self.ui = Ui_routingDialog()
         self.ui.setupUi(self)
         self.setWindowTitle("MIDI Port Manager")
-
-        # ── Μεγάλωσε το παράθυρο ──
         self.resize(1000, 600)
         self.setMinimumSize(900, 500)
+        self.pending = set(getattr(main_app, "selected_inputs", []) or [])  # αλλαγές σε αναμονή
 
-        # ── Table: stretch να γεμίζει το παράθυρο ──
+        # ── Table ──
         table = self.ui.routingTable
-        table.setGeometry(QtCore.QRect(10, 10, 980, 520))  # override fixed geometry
         table.setSizePolicy(
             QtWidgets.QSizePolicy.Expanding,
             QtWidgets.QSizePolicy.Expanding
         )
-
-        # ── Row height μικρότερο ──
         table.verticalHeader().setDefaultSectionSize(32)
-        table.verticalHeader().hide()  # κρύψε τον αριθμό γραμμής αριστερά
+        table.verticalHeader().hide()
 
-        # ── 5 columns με stretch ──
         table.setColumnCount(5)
         table.setHorizontalHeaderLabels(
             ["Type", "User / Device", "Stream / Port", "Virtual MIDI Port", "Active"]
@@ -2018,11 +2011,9 @@ class RoutingManager(QDialog):
         header.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)  # Virtual MIDI Port
         header.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)  # Active
 
-        # ── Κουμπιά κάτω δεξιά ──
-        self.ui.horizontalLayoutWidget.setGeometry(QtCore.QRect(700, 545, 280, 40))
-
-        self.ui.refreshButton.clicked.connect(self.refresh_table)
-        self.ui.cancelButton.clicked.connect(self.close)
+        self.ui.okButton.clicked.connect(self.apply_changes)
+        self.ui.refreshButton.clicked.connect(self.on_refresh)
+        self.ui.cancelButton.clicked.connect(self.reject)
 
         self.refresh_table()
 
@@ -2070,7 +2061,7 @@ class RoutingManager(QDialog):
 
         physical_inputs = [n for n in all_inputs if not is_vmidi_or_metronome(n)]
 
-        selected = set(getattr(self.main_app, "selected_inputs", []) or [])
+        selected = set(self.pending)
         selected_bases = {base_name(x) for x in selected}
 
         for disp_name, dev_name in device_choices(physical_inputs):
@@ -2167,58 +2158,67 @@ class RoutingManager(QDialog):
             table.setItem(row, 4, item_active)
 
     def toggle_local_device(self, dev_name: str, state: int):
-        """Ενεργοποιεί ή απενεργοποιεί μια τοπική MIDI συσκευή κατά τη διάρκεια του session."""
-        selected = set(getattr(self.main_app, "selected_inputs", []) or [])
+        """Καταγράφει μόνο την επιλογή. Εφαρμόζεται όταν πατηθεί OK."""
+        self.pending = {x for x in self.pending if base_name(x) != base_name(dev_name)}
+        if state == QtCore.Qt.Checked:
+            self.pending.add(dev_name)
+
+    def _close_device(self, room_win, dev_name):
+        to_remove = []
+        for sid, port in list(room_win.midi_inputs):
+            if base_name(room_win.stream_devices.get(sid, "")) == base_name(dev_name):
+                safe_close_port(port, sid)
+                to_remove.append(sid)
+        room_win.midi_inputs = [(s, p) for s, p in room_win.midi_inputs if s not in to_remove]
+        for sid in to_remove:
+            room_win.stream_devices.pop(sid, None)
+            room_win.failed_inputs.discard(dev_name.lower())
+        print(f"🔌 Έκλεισε MIDI input: {dev_name}")
+
+    def apply_changes(self):
+        old = list(getattr(self.main_app, "selected_inputs", []) or [])
+        new = list(self.pending)
+        old_bases = {base_name(x) for x in old}
+        new_bases = {base_name(x) for x in new}
+
+        enabled = [d for d in new if base_name(d) not in old_bases]
+        disabled = [d for d in old if base_name(d) not in new_bases]
+
+        self.main_app.selected_inputs = new  # πρώτα η λίστα, γιατί το try_reopen_device την ελέγχει
         room_win = getattr(self.main_app, "room_window", None)
 
-        if state == QtCore.Qt.Checked:
-            # ── ΕΝΕΡΓΟΠΟΙΗΣΗ ──
-            selected.add(dev_name)
-            self.main_app.selected_inputs = list(selected)
-            print(f"➕ Ενεργοποίηση συσκευής: {dev_name}")
-
-            if room_win:
-                # άμεση ασύγχρονη επαναφορά
-                QtCore.QTimer.singleShot(
-                    500, lambda d=dev_name: room_win.try_reopen_device(d)
-                )
-
-        else:
-            # ── ΑΠΕΝΕΡΓΟΠΟΙΗΣΗ ──
-            selected.discard(dev_name)
-            self.main_app.selected_inputs = list(selected)
-            print(f"➖ Απενεργοποίηση συσκευής: {dev_name}")
-
-            if room_win:
-                # βρες και κλείσε το port
-                to_remove = []
-                for sid, port in list(room_win.midi_inputs):
-                    if room_win.stream_devices.get(sid, "").lower() == dev_name.lower():
-                        safe_close_port(port, sid)
-                        to_remove.append(sid)
-
-                room_win.midi_inputs = [
-                    (s, p) for s, p in room_win.midi_inputs if s not in to_remove
-                ]
-                for sid in to_remove:
-                    room_win.stream_devices.pop(sid, None)
-                    room_win.failed_inputs.discard(dev_name.lower())
-
-                # ενημέρωσε τους peers ότι αυτό το stream δεν υπάρχει πια
+        if room_win:
+            for d in disabled:
+                self._close_device(room_win, d)
+            if disabled:
                 room_win.send_streams_announce()
-                print(f"🔌 Έκλεισε MIDI input: {dev_name}")
+            for d in enabled:
+                QtCore.QTimer.singleShot(500, lambda d=d: room_win.try_reopen_device(d))
 
-        # ανανέωσε τον πίνακα
-        QtCore.QTimer.singleShot(200, self.refresh_table)
+        self.accept()
+
+    def on_refresh(self):
+        force_winmm_refresh()  # ώστε το WinMM να ξαναδεί τις συσκευές
+        self.main_app.refresh_midi_state()
+        self.refresh_table()
+
 
 class LogSettingsDialog(QtWidgets.QDialog):
     """Παράθυρο με τικ για έλεγχο του τι εμφανίζεται πού."""
+    peers_changed = QtCore.pyqtSignal()
     def __init__(self, room_window):
         super().__init__()
         self.room_window = room_window
         self.lm = room_window.log_manager
         self.setWindowTitle("Log Settings")
         self.resize(600, 500)
+
+        # αντίγραφο των ρυθμίσεων: γράφεται στο LogManager μόνο με Apply / OK
+        self.pending = {}
+        for cat in self.lm.CATEGORIES:
+            self.pending[("cat", cat)] = dict(self.lm.routing[cat])
+        for peer, route in self.lm.peer_routing.items():
+            self.pending[("peer", peer)] = dict(route)
 
         layout = QtWidgets.QVBoxLayout(self)
 
@@ -2238,31 +2238,36 @@ class LogSettingsDialog(QtWidgets.QDialog):
         file_row.addWidget(self.file_label)
         layout.addLayout(file_row)
 
-        close_btn = QtWidgets.QPushButton("Close")
-        close_btn.clicked.connect(self.close)
-        layout.addWidget(close_btn)
-
+        # Κουμπιά κάτω δεξιά
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch(1)
+        ok_btn = QtWidgets.QPushButton("OK")
+        apply_btn = QtWidgets.QPushButton("Apply")
+        cancel_btn = QtWidgets.QPushButton("Cancel")
+        ok_btn.clicked.connect(self.accept_changes)
+        apply_btn.clicked.connect(self.apply_changes)
+        cancel_btn.clicked.connect(self.reject)
+        for b in (ok_btn, apply_btn, cancel_btn):
+            btn_row.addWidget(b)
+        layout.addLayout(btn_row)
+        # δυναμική ενημέρωση όταν μπαίνουν/φεύγουν χρήστες
+        self.peers_changed.connect(self.sync_peers)
+        self.lm.peer_listener = self.peers_changed.emit
+        self.finished.connect(self._detach_listener)
         self.refresh_table()
 
     def refresh_table(self):
         self.table.setRowCount(0)
 
-        # στατικές κατηγορίες
-        rows = [(cat, None) for cat in self.lm.CATEGORIES]
-        # δυναμικές peer κατηγορίες
-        for peer in self.lm.peer_routing.keys():
-            rows.append((f"PEER: {peer}", peer))
+        for (kind, name), route in self.pending.items():
+            label = name if kind == "cat" else f"PEER: {name}"
 
-        for label, peer in rows:
             row = self.table.rowCount()
             self.table.insertRow(row)
 
             item = QtWidgets.QTableWidgetItem(label)
             item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
             self.table.setItem(row, 0, item)
-
-            route = (self.lm.peer_routing[peer] if peer
-                     else self.lm.routing[label])
 
             for col, dest in enumerate(["cmd", "room", "file"], start=1):
                 chk = QtWidgets.QCheckBox()
@@ -2276,6 +2281,17 @@ class LogSettingsDialog(QtWidgets.QDialog):
                 l.setAlignment(QtCore.Qt.AlignCenter)
                 l.setContentsMargins(0, 0, 0, 0)
                 self.table.setCellWidget(row, col, cell)
+
+    def apply_changes(self):
+        """Γράφει τις ρυθμίσεις στο LogManager και μένει στο παράθυρο."""
+        for (kind, name), route in self.pending.items():
+            target = self.lm.routing.get(name) if kind == "cat" else self.lm.peer_routing.get(name)
+            if target is not None:
+                target.update(route)
+
+    def accept_changes(self):
+        self.apply_changes()
+        self.accept()
 
     def toggle_file(self):
         if self.lm.file_enabled:
@@ -2329,6 +2345,17 @@ class RoomSettingsWindow(QMainWindow):
 
         self.close()
 
+    def sync_peers(self):
+        """Προσθέτει/αφαιρεί γραμμές peers χωρίς να χαθούν οι μη εφαρμοσμένες αλλαγές."""
+        for peer, route in self.lm.peer_routing.items():
+            if ("peer", peer) not in self.pending:
+                self.pending[("peer", peer)] = dict(route)
+        for key in [k for k in self.pending if k[0] == "peer" and k[1] not in self.lm.peer_routing]:
+            del self.pending[key]
+        self.refresh_table()
+
+    def _detach_listener(self, *_):
+        self.lm.peer_listener = None
 
 class MidiUserApp(QMainWindow):
     def __init__(self):
@@ -2546,7 +2573,8 @@ class MidiUserApp(QMainWindow):
             wms_exe = os.path.join(base_dir, "wms", "midiroomsports_wms.exe")
             exe_path = wms_exe if os.path.exists(wms_exe) else os.path.join(base_dir, "midiroomsports.exe")
             print("DEBUG helper exe path:", exe_path)
-            self.vmidi = VirtualMidiBridge(exe_path)
+            extra = ["--nosweep"] if os.environ.get("MIDIROOMS_NOSWEEP") else []
+            self.vmidi = VirtualMidiBridge(exe_path, extra)
             print("✅ vmidi bridge started")
         except Exception as e:
             self.vmidi = None
@@ -2602,11 +2630,34 @@ class MidiUserApp(QMainWindow):
         return f"{user}_main_{suf}"[:31]
 
     def make_remote_port_name(self, sender: str, device: str, stream_id: str) -> str:
-        user = self._short_user(sender, 8)
-        dev = self._short_dev(device, 4)
-        i = self._stream_idx(stream_id, 1)
-        suf = self._suffix()
-        return f"{user}_{dev}_{i}_{suf}"[:31]
+        user = re.sub(r"[^A-Za-z0-9]+", "", sender or "user")[:10] or "user"
+        dev = re.sub(r"[^A-Za-z0-9]+", "_", display_name(device)).strip("_") or "midi"
+        return f"{user}_{dev}"[:PORT_BASE_MAX]
+
+    def open_remote_port(self, key, device):
+        """Δημιουργεί loopback ζεύγος για (χρήστης, stream). Επιστρέφει το όνομα ή None."""
+        self.ensure_vmidi_bridge()
+        if not getattr(self, "vmidi", None):
+            return None
+        sender, stream = key
+        base = self.make_remote_port_name(sender, device, stream)
+        name, n = base, 2
+        while name in self.created_vmidi_ports:
+            suffix = f"_{n}"
+            name = base[:PORT_BASE_MAX - len(suffix)] + suffix
+            n += 1
+        if self.vmidi.create(name, settle=0.2):
+            self.created_vmidi_ports.add(name)
+            return name
+        return None
+
+    def close_remote_port(self, name):
+        if not name or name == getattr(self, "metronome_port_name", None):
+            return
+        if getattr(self, "vmidi", None) and name in self.created_vmidi_ports:
+            self.vmidi.close(name)
+            self.created_vmidi_ports.discard(name)
+            print(f"♻️ Closed port {name}")
 
     def make_stream_id(self, dev_name: str, idx: int) -> str:
         base = "".join(c if c.isalnum() else "_" for c in (display_name(dev_name) or "device")).strip("_")
@@ -2819,18 +2870,19 @@ class MidiUserApp(QMainWindow):
         QtWidgets.QApplication.quit()
 
 
-class SettingsWindow(QMainWindow):
+class SettingsWindow(QWidget):
     def __init__(self, main_app=None):
         super().__init__()
         self.ui = Ui_SettingsForm()
         self.ui.setupUi(self)
         self.setWindowTitle("Settings")
         self.main_app = main_app
-        self.ui.applyButton.clicked.connect(self.apply_settings)
+        self.ui.okButton.clicked.connect(self.apply_settings)
         self.ui.cancelButton.clicked.connect(self.close)
+        self.ui.refreshButton.clicked.connect(self.refresh_devices)
         self.load_midi_devices()
 
-    def load_midi_devices(self):
+    def load_midi_devices(self, checked=None):
         import mido
         from PyQt5 import QtCore, QtWidgets
 
@@ -2846,7 +2898,10 @@ class SettingsWindow(QMainWindow):
             and not n.lower().startswith("midirooms.")
         ]
 
-        selected_inputs = getattr(self.main_app, "selected_inputs", []) or []
+        if checked is not None:
+            selected_inputs = checked
+        else:
+            selected_inputs = getattr(self.main_app, "selected_inputs", []) or []
         selected_bases = {base_name(x) for x in selected_inputs}
 
         for disp_name, name in device_choices(input_names):
@@ -2871,18 +2926,18 @@ class SettingsWindow(QMainWindow):
                 selected.append(item.data(QtCore.Qt.UserRole) or item.text())
         return selected
 
+    def refresh_devices(self):
+        keep = self._get_checked_inputs_from_ui()  # κρατάμε ό,τι έχετε τσεκάρει αυτή τη στιγμή
+        if self.main_app:
+            self.main_app.refresh_midi_state()
+        self.load_midi_devices(checked=keep)
+
     def apply_settings(self):
         selected_inputs = self._get_checked_inputs_from_ui()
         if self.main_app:
             self.main_app.selected_inputs = selected_inputs
             self.main_app.midi_service_was_refreshed = True
             self.main_app.midi_refresh_time = time.time()
-
-            QMessageBox.information(
-                self,
-                "MIDI Settings Applied",
-                f"Inputs: {[display_name(n) for n in selected_inputs]}\nLocal DAW monitoring should use the physical MIDI input directly."
-            )
         self.close()
 
 

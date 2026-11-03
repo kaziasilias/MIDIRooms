@@ -9,7 +9,8 @@ using Microsoft.Windows.Devices.Midi2;
 using Microsoft.Windows.Devices.Midi2.Messages;
 using Microsoft.Windows.Devices.Midi2.Endpoints.Loopback;
 
-const string TxSuffix = " (app-only)";
+const string TxSuffix = " (MR)";      // A side: εκεί γράφει ο helper
+const string DawSuffix = " (DAW)";    // B side: το ανοίγει το DAW ως MIDI input
 const int MaxName = 31; // WinMM port name limit
 
 var logPath = Path.Combine(AppContext.BaseDirectory, "midiroomsports_wms.log");
@@ -47,7 +48,10 @@ int SweepOrphans()
     return found.Count;
 }
 
-try { Log($"sweep removed {SweepOrphans()} orphan pair(s)"); } catch (Exception e) { Log("sweep failed: " + e.Message); }
+if (!args.Contains("--nosweep"))
+{
+    try { Log($"sweep removed {SweepOrphans()} orphan pair(s)"); } catch (Exception e) { Log("sweep failed: " + e.Message); }
+}
 
 var ports = new Dictionary<string, Port>(StringComparer.OrdinalIgnoreCase);
 
@@ -90,13 +94,14 @@ while ((line = Console.ReadLine()) != null)
                 if (ports.ContainsKey(name)) { Reply("OK exists"); break; }
 
                 var txBase = name.Length > MaxName - TxSuffix.Length ? name.Substring(0, MaxName - TxSuffix.Length) : name;
+                var dawBase = name.Length > MaxName - DawSuffix.Length ? name.Substring(0, MaxName - DawSuffix.Length) : name;
                 var assoc = Guid.NewGuid();
                 var uid = new string(Guid.NewGuid().ToString().Where(char.IsAsciiLetterOrDigit).ToArray());
 
                 var cfg = new MidiLoopbackEndpointCreationConfig();
                 cfg.AssociationId = assoc;
                 cfg.EndpointDefinitionA = new MidiLoopbackEndpointDefinition() { Name = txBase + TxSuffix, UniqueId = uid };
-                cfg.EndpointDefinitionB = new MidiLoopbackEndpointDefinition() { Name = name, UniqueId = uid };
+                cfg.EndpointDefinitionB = new MidiLoopbackEndpointDefinition() { Name = dawBase + DawSuffix, UniqueId = uid };
 
                 var res = MidiLoopbackEndpointManager.CreateTransientLoopbackEndpoints(cfg);
                 if (!res.Success) { Log($"CREATE {name} failed: {res.ErrorInformation}"); Reply("ERR create failed"); break; }

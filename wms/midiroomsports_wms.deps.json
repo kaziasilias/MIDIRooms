@@ -1,11 +1,12 @@
 {
   "runtimeTarget": {
-    "name": ".NETCoreApp,Version=v10.0",
+    "name": ".NETCoreApp,Version=v10.0/win-x64",
     "signature": ""
   },
   "compilationOptions": {},
   "targets": {
-    ".NETCoreApp,Version=v10.0": {
+    ".NETCoreApp,Version=v10.0": {},
+    ".NETCoreApp,Version=v10.0/win-x64": {
       "midiroomsports_wms/1.0.0": {
         "dependencies": {
           "Microsoft.Windows.Devices.Midi2": "1.0.17-rc.4.25",
@@ -28,16 +29,8 @@
         }
       },
       "Microsoft.Windows.Devices.Midi2/1.0.17-rc.4.25": {
-        "runtimeTargets": {
-          "runtimes/win-arm64/lib/net10.0/Microsoft.Windows.Devices.Midi2.NetProjection.dll": {
-            "rid": "win-arm64",
-            "assetType": "runtime",
-            "assemblyVersion": "1.0.17.25",
-            "fileVersion": "1.0.17.25"
-          },
+        "runtime": {
           "runtimes/win-x64/lib/net10.0/Microsoft.Windows.Devices.Midi2.NetProjection.dll": {
-            "rid": "win-x64",
-            "assetType": "runtime",
             "assemblyVersion": "1.0.17.25",
             "fileVersion": "1.0.17.25"
           }

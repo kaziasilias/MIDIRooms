@@ -11,8 +11,15 @@
     <Platforms>AnyCPU;x64</Platforms>
   </PropertyGroup>
 
+  <!-- The new package has no prebuilt .NET projection: CsWinRT generates it from the .winmd -->
+  <PropertyGroup>
+    <CSWinRTInputs>Windows.Devices.Midi2</CSWinRTInputs>
+    <CsWinRTIncludes>Windows.Devices.Midi2</CsWinRTIncludes>
+  </PropertyGroup>
+
   <ItemGroup>
-    <PackageReference Include="Microsoft.Windows.Devices.Midi2" Version="*-*" />
+    <PackageReference Include="Microsoft.Windows.CsWinRT" Version="2.2.0" />
+    <PackageReference Include="Windows.Devices.Midi2" Version="0.99.92-preview.11" />
   </ItemGroup>
 
 </Project>

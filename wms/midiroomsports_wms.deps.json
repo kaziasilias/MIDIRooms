@@ -9,7 +9,7 @@
     ".NETCoreApp,Version=v10.0/win-x64": {
       "midiroomsports_wms/1.0.0": {
         "dependencies": {
-          "Microsoft.Windows.Devices.Midi2": "1.0.17-rc.4.25",
+          "Windows.Devices.Midi2": "0.99.92-preview.11",
           "runtimepack.Microsoft.Windows.SDK.NET.Ref": "10.0.26100.57"
         },
         "runtime": {
@@ -28,11 +28,16 @@
           }
         }
       },
-      "Microsoft.Windows.Devices.Midi2/1.0.17-rc.4.25": {
-        "runtime": {
-          "runtimes/win-x64/lib/net10.0/Microsoft.Windows.Devices.Midi2.NetProjection.dll": {
-            "assemblyVersion": "1.0.17.25",
-            "fileVersion": "1.0.17.25"
+      "Windows.Devices.Midi2/0.99.92-preview.11": {
+        "native": {
+          "runtimes/win-x64/native/Windows.Devices.Midi2.dll": {
+            "fileVersion": "1.0.16.0"
+          },
+          "runtimes/win-x64/native/Windows.Devices.Midi2.pdb": {
+            "fileVersion": "0.0.0.0"
+          },
+          "runtimes/win-x64/native/Windows.Devices.Midi2.pri": {
+            "fileVersion": "0.0.0.0"
           }
         }
       }
@@ -49,12 +54,12 @@
       "serviceable": false,
       "sha512": ""
     },
-    "Microsoft.Windows.Devices.Midi2/1.0.17-rc.4.25": {
+    "Windows.Devices.Midi2/0.99.92-preview.11": {
       "type": "package",
       "serviceable": true,
-      "sha512": "sha512-veFnyRVsrTsOdW9jpybacE6QRV3zsco1MEae8ivZ2Im1ftZKZMXFIB4Gf2JAcx842vTg2R4sYKGG8Dbx5HpZdg==",
-      "path": "microsoft.windows.devices.midi2/1.0.17-rc.4.25",
-      "hashPath": "microsoft.windows.devices.midi2.1.0.17-rc.4.25.nupkg.sha512"
+      "sha512": "sha512-FtcDZZEBaskhcq4PsKDHf+5anb9UqbXuTv94AEk9Zle4uOUd4WZ6RuL8HaVFBaVm3+nAV6FtogaZUtfrPcqNyg==",
+      "path": "windows.devices.midi2/0.99.92-preview.11",
+      "hashPath": "windows.devices.midi2.0.99.92-preview.11.nupkg.sha512"
     }
   }
 }

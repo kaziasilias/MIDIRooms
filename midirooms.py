@@ -30,6 +30,96 @@ import subprocess, threading, queue
 import csv as _csv_module
 from datetime import datetime as _dt
 
+class ExperimentRecorder:
+    """
+    Καταγραφή μετρήσεων ανά νότα, ένα ζευγάρι αρχείων ανά "run" (Start/Stop από το checkbox Record CSV):
+      experiment_RECEIVED_<user>_<tag>_<ώρα>.csv : μία γραμμή ανά νότα που ΠΑΙΧΤΗΚΕ στον παραλήπτη
+      experiment_SENT_<user>_<tag>_<ώρα>.csv     : μία γραμμή ανά μήνυμα που ΣΤΑΛΘΗΚΕ (για ανίχνευση απώλειας)
+
+    Στήλες RECEIVED:
+      seq, user, stream, type, ch, note, vel
+      arrival_s        : perf_counter τη στιγμή που ήρθε το μήνυμα στην εφαρμογή
+      sender_ts_s      : timestamp αποστολέα μεταφερμένο στο τοπικό ρολόι (με το offset από τον server)
+      transit_est_ms   : arrival - sender_ts   (ΠΡΙΝ το buffer, εκτίμηση: εξαρτάται από το clock offset)
+      buf_base_ms, buf_extra_ms, delay_ms : buffer που εφαρμόστηκε (delay = base + extra)
+      slack_ms         : (buffer ΠΡΙΝ την ανύψωση) - transit_est_ms  (αρνητικό = ήρθε αργά)
+      late             : 1 αν η νότα ήρθε αργά (play_time < now + 2 ms), αλλιώς 0
+      play_time_s      : προγραμματισμένη στιγμή αναπαραγωγής
+      played_s         : πραγματική στιγμή αναπαραγωγής
+      lateness_ms      : played - play_time
+      send_ms          : διάρκεια της κλήσης προς τη virtual θύρα
+      eff_delay_ms     : max(delay, transit + 2) + lateness
+      adaptive, server_offset_ms, server_jitter_ms
+    """
+    RECV_COLS = ["seq", "user", "stream", "type", "ch", "note", "vel",
+                 "arrival_s", "sender_ts_s", "transit_est_ms",
+                 "buf_base_ms", "buf_extra_ms", "delay_ms", "slack_ms", "late",
+                 "play_time_s", "played_s", "lateness_ms", "send_ms", "eff_delay_ms",
+                 "adaptive", "server_offset_ms", "server_jitter_ms", "status"]
+    SENT_COLS = ["seq", "stream", "type", "ch", "note", "vel", "send_ts_s", "input_ts"]
+
+    def __init__(self):
+        self.active = False
+        self._rf = self._sf = None
+        self._rw = self._sw = None
+        self.recv_path = self.sent_path = None
+        self.n_recv = 0
+        self.n_sent = 0
+
+    def start(self, username, tag):
+        if self.active:
+            return
+        stamp = _dt.now().strftime("%Y%m%d_%H%M%S")
+        base = f"{username}_{tag}_{stamp}"
+        self.recv_path = f"experiment_RECEIVED_{base}.csv"
+        self.sent_path = f"experiment_SENT_{base}.csv"
+        self._rf = open(self.recv_path, "w", newline="", encoding="utf-8")
+        self._sf = open(self.sent_path, "w", newline="", encoding="utf-8")
+        self._rw = _csv_module.writer(self._rf)
+        self._sw = _csv_module.writer(self._sf)
+        self._rw.writerow(self.RECV_COLS)
+        self._sw.writerow(self.SENT_COLS)
+        self.n_recv = self.n_sent = 0
+        self.active = True
+        print(f"📝 Experiment CSV: {self.recv_path} + {self.sent_path}")
+
+    def stop(self):
+        if not self.active:
+            return
+        self.active = False
+        for f in (self._rf, self._sf):
+            try:
+                f.flush()
+                f.close()
+            except Exception:
+                pass
+        print(f"📝 Experiment CSV closed: {self.n_recv} received, {self.n_sent} sent")
+        self._rf = self._sf = self._rw = self._sw = None
+
+    def log_sent(self, seq, stream, msg_type, ch, note, vel, send_ts, input_ts=None):
+        if not self.active:
+            return
+        try:
+            self._sw.writerow([seq, stream, msg_type, ch, note, vel,
+                               f"{send_ts:.6f}", "" if input_ts is None else input_ts])
+            self.n_sent += 1
+        except Exception:
+            pass
+
+    def log_received(self, rec):
+        """rec: dict με τα κλειδιά του RECV_COLS (όσα λείπουν γράφονται κενά)."""
+        if not self.active:
+            return
+        try:
+            self._rw.writerow([rec.get(c, "") for c in self.RECV_COLS])
+            self.n_recv += 1
+            if self.n_recv % 50 == 0:
+                self._rf.flush()
+                self._sf.flush()
+        except Exception:
+            pass
+
+
 class LogManager:
     """
     Κεντρικό σύστημα logging με κατηγορίες και 3 προορισμούς:
@@ -46,7 +136,7 @@ class LogManager:
         # destinations: "cmd", "room", "file"
         self.routing = {}
         for cat in self.CATEGORIES:
-            self.routing[cat] = {"cmd": True, "room": True, "file": False}
+            self.routing[cat] = {"cmd": True, "room": True, "file": True}   # file=True: αποθήκευση σε CSV από προεπιλογή
 
         # δυναμικές κατηγορίες ανά peer: "PEER:<username>"
         self.peer_routing = {}  # username -> {"cmd":bool,"room":bool,"file":bool}
@@ -55,11 +145,12 @@ class LogManager:
         self.csv_file = None
         self.csv_writer = None
         self.file_enabled = False
+        self.file_path = None
 
     # ---- διαχείριση peer κατηγοριών ----
     def ensure_peer(self, username):
         if username not in self.peer_routing:
-            self.peer_routing[username] = {"cmd": True, "room": True, "file": False}
+            self.peer_routing[username] = {"cmd": True, "room": True, "file": True}
             if self.peer_listener:
                 self.peer_listener()
 
@@ -73,6 +164,7 @@ class LogManager:
             self.csv_file = open(filepath, "w", newline="", encoding="utf-8")
             self.csv_writer = _csv_module.writer(self.csv_file)
             self.csv_writer.writerow(["timestamp", "category", "message"])
+            self.file_path = filepath
             self.file_enabled = True
             self.log("SYSTEM", f"📝 Logging to file: {filepath}")
         except Exception as e:
@@ -88,6 +180,7 @@ class LogManager:
             pass
         self.csv_file = None
         self.csv_writer = None
+        self.file_path = None
 
     # ---- κύρια μέθοδος logging ----
     def log(self, category, message, peer=None):
@@ -97,10 +190,10 @@ class LogManager:
         """
         if peer is not None:
             self.ensure_peer(peer)
-            route = self.peer_routing.get(peer, {"cmd": True, "room": True, "file": False})
+            route = self.peer_routing.get(peer, {"cmd": True, "room": True, "file": True})
             cat_label = f"PEER:{peer}"
         else:
-            route = self.routing.get(category, {"cmd": True, "room": True, "file": False})
+            route = self.routing.get(category, {"cmd": True, "room": True, "file": True})
             cat_label = category
 
         # 1) console
@@ -569,7 +662,12 @@ class RoomWindow(QWidget):
         self.ui.LeaveButton.clicked.connect(self.leave_room)
         self.ui.logArea.clear()
         self.log_manager = LogManager(self)
+        self._auto_start_room_log()
         self.user_ui_elements = {}
+        self.user_name_labels = {}      # username -> QLabel (για την ένδειξη "(leader)")
+        self.user_ips = {}              # username -> IP όπως τη βλέπει ο server
+        self._logged_ips = set()        # χρήστες των οποίων η IP έχει ήδη γραφτεί στο log
+        self._make_users_layout_horizontal()
         self.user_velocity_bars = {}
         self.user_latency_labels = {}
         self.velocity_reset_timers = {}  # username -> QTimer
@@ -977,10 +1075,45 @@ class RoomWindow(QWidget):
                     pass
         event.accept()
 
+    def _make_users_layout_horizontal(self):
+        """Οι χρήστες του δωματίου μπαίνουν ο ένας δίπλα στον άλλον (όχι κάτω από τον άλλον)."""
+        try:
+            parent_layout = self.ui.verticalLayout_3
+            old = self.ui.uservelocityLayout
+            new = QtWidgets.QHBoxLayout()
+            new.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+            idx = parent_layout.indexOf(old)
+            parent_layout.removeItem(old)
+            parent_layout.insertLayout(max(idx, 0), new)
+            old.deleteLater()
+            self.ui.uservelocityLayout = new
+            self.ui.scrollArea.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        except Exception as e:
+            print(f"⚠️ Could not make users layout horizontal: {e}")
+
+    def _auto_start_room_log(self):
+        """Προεπιλογή: το log του δωματίου αποθηκεύεται σε CSV στον φάκελο όπου τρέχει η εφαρμογή.
+        Απενεργοποιείται από Log Settings -> Stop Saving."""
+        import os, re as _re
+        try:
+            safe = lambda x: _re.sub(r"[^A-Za-z0-9_-]+", "_", str(x))
+            fname = f"midirooms_log_{safe(self.main_app.username)}_{safe(self.room_name)}_{_dt.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            self.log_manager.start_file(os.path.join(os.getcwd(), fname))
+        except Exception as e:
+            print(f"⚠️ Could not auto-start room log: {e}")
+
     def leave_room(self):
         if self._left:
             return          # ήδη έχουμε φύγει (π.χ. kicked + leave)
         self._left = True
+        try:
+            self.exp.stop()            # κλείσιμο των experiment CSV
+        except Exception:
+            pass
+        try:
+            self.log_manager.stop_file()   # κλείσιμο του log του δωματίου
+        except Exception:
+            pass
         if hasattr(self, "piano"):
             self.piano.clear_all()
 
@@ -1180,6 +1313,9 @@ class RoomWindow(QWidget):
                             "room": self.room_name,
                             "tcp_midi": True,  # flag για τον server να το κάνει relay
                         }
+                        self.exp.log_sent(self.midi_seq, stream_id, msg.type, getattr(msg, "channel", 0),
+                                          note, velocity, midi_event["timestamp"] - self.server_clock_offset,
+                                          input_ts)
                         asyncio.get_event_loop().create_task(
                             self.main_app.ws.send(json.dumps(midi_event))
                         )
@@ -1233,6 +1369,10 @@ class RoomWindow(QWidget):
         self.main_app.room_leader = leader
 
         is_leader = (leader == self.main_app.username)
+
+        # ένδειξη "(leader)" δίπλα στο όνομα του leader
+        for user, lbl in self.user_name_labels.items():
+            lbl.setText(f"{user} (leader)" if (leader and user == leader) else user)
 
         for user, container in self.user_ui_elements.items():
             # find the Assign Leader button inside this user's widget
@@ -1430,6 +1570,28 @@ class RoomWindow(QWidget):
 
                 jitter_s = self.peer_jitter.get("_server", 0.005)
                 play_time = self._compute_play_time(sender_ts_local)
+                exp_rec = None
+                if self.exp.active:
+                    arrival = self._last_arrival
+                    transit_ms = (arrival - sender_ts_local) * 1000.0
+                    delay_ms = (self.buffer_base_s + self.buffer_extra_s) * 1000.0     # buffer που εφαρμόστηκε (μετά την ανύψωση)
+                    pre_delay_ms = self._last_pre_delay_s * 1000.0                    # buffer πριν την ανύψωση
+                    exp_rec = {
+                        "late": int(self._last_late),
+                        "seq": seq, "user": user, "stream": stream, "type": msg_type,
+                        "ch": ch, "note": note, "vel": effective_velocity,
+                        "arrival_s": f"{arrival:.6f}", "sender_ts_s": f"{sender_ts_local:.6f}",
+                        "transit_est_ms": f"{transit_ms:.3f}",
+                        "buf_base_ms": f"{self.buffer_base_s * 1000.0:.1f}",
+                        "buf_extra_ms": f"{self.buffer_extra_s * 1000.0:.1f}",
+                        "delay_ms": f"{delay_ms:.1f}",
+                        "slack_ms": f"{pre_delay_ms - transit_ms:.3f}",
+                        "play_time_s": f"{play_time:.6f}",
+                        "adaptive": int(self.adaptive_buffer),
+                        "server_offset_ms": f"{self.server_clock_offset * 1000.0:.2f}",
+                        "server_jitter_ms": f"{self.peer_jitter.get('_server', 0.0) * 1000.0:.2f}",
+                        "status": "nosync" if self.server_clock_offset == 0.0 else "ok",
+                    }
                 print(f"CALC ts_server={sender_ts_server:.1f} my_offset={self.server_clock_offset:.1f} play_time={play_time:.1f} now={time.perf_counter():.1f} diff={play_time-time.perf_counter():.3f}")
                 is_noteoff = (msg_type == "note_off" or
                               (msg_type == "note_on" and effective_velocity == 0))
@@ -1455,6 +1617,7 @@ class RoomWindow(QWidget):
                     "note": note,
                     "velocity": effective_velocity,
                     "channel": ch,
+                    "_rec": exp_rec,
                 })
 
                 self.remote_midi_queue.sort(key=lambda e: e["play_time"])
@@ -1490,12 +1653,34 @@ class RoomWindow(QWidget):
         self.ui.horizontalLayout.addWidget(self.bufferSlider)
         self.ui.horizontalLayout.addWidget(self.adaptiveCheck)
 
+        # Καταγραφή μετρήσεων: ένα ζευγάρι CSV (RECEIVED + SENT) ανά Start/Stop
+        self.exp = ExperimentRecorder()
+        self._last_arrival = time.perf_counter()
+        self._last_pre_delay_s = self.buffer_base_s
+        self._last_late = False
+        self.recordCsvCheck = QtWidgets.QCheckBox("Record CSV", self)
+        self.recordCsvCheck.setToolTip("Ξεκινά/σταματά την καταγραφή μετρήσεων ανά νότα (experiment_RECEIVED/SENT_*.csv)")
+        self.ui.horizontalLayout.addWidget(self.recordCsvCheck)
+        self.recordCsvCheck.toggled.connect(self._on_record_csv_toggled)
+
         self.bufferSlider.valueChanged.connect(self._on_buffer_slider)
         self.adaptiveCheck.toggled.connect(self._on_adaptive_toggled)
 
         self.buffer_label_timer = QtCore.QTimer(self)
         self.buffer_label_timer.timeout.connect(self._refresh_buffer_label)
         self.buffer_label_timer.start(500)
+
+    def _on_record_csv_toggled(self, checked):
+        if checked:
+            if self.adaptive_buffer:
+                tag = f"adaptive{int(round(self.buffer_base_s * 1000))}"
+            else:
+                tag = f"fixed{int(round(self.buffer_base_s * 1000))}"
+            self.exp.start(self.main_app.username, tag)
+            self.recordCsvCheck.setText("Recording...")
+        else:
+            self.exp.stop()
+            self.recordCsvCheck.setText("Record CSV")
 
     def _on_buffer_slider(self, value):
         self.buffer_base_s = value / 1000.0
@@ -1517,15 +1702,21 @@ class RoomWindow(QWidget):
         Αν η νότα έρθει αργά, το επιπλέον buffer ανεβαίνει όσο χρειάζεται ώστε οι επόμενες
         να προλαβαίνουν· όταν δεν υπάρχουν αργές νότες, χαλαρώνει με RELAX_MS_PER_S ms/s."""
         now = time.perf_counter()
+        self._last_arrival = now            # για το experiment CSV (στιγμή άφιξης του μηνύματος)
         dt = max(0.0, now - self._extra_last_ts)
         self._extra_last_ts = now
 
         if not self.adaptive_buffer or self.server_clock_offset == 0.0:
             # χωρίς adaptive (ή χωρίς ολοκληρωμένο clock sync): μόνο η βάση
+            self._last_pre_delay_s = self.buffer_base_s
+            self._last_late = (sender_ts_local + self.buffer_base_s) < (now + 0.002)
             return max(sender_ts_local + self.buffer_base_s, now + 0.002)
 
         self.buffer_extra_s = max(0.0, self.buffer_extra_s - (RELAX_MS_PER_S / 1000.0) * dt)
         play_time = sender_ts_local + self.buffer_base_s + self.buffer_extra_s
+        # buffer ΠΡΙΝ την ενδεχόμενη ανύψωση (για το slack_ms στο experiment CSV)
+        self._last_pre_delay_s = self.buffer_base_s + self.buffer_extra_s
+        self._last_late = play_time < now + 0.002
 
         if play_time < now + 0.002:                       # ήρθε αργά
             needed = (now + 0.002) - (sender_ts_local + self.buffer_base_s)
@@ -1540,7 +1731,10 @@ class RoomWindow(QWidget):
         now = time.perf_counter()
         # πέτα "δηλητηριασμένες" νότες (play_time πολύ μακριά = offset δεν είχε συγχρονιστεί)
         while self.remote_midi_queue and (self.remote_midi_queue[0]["play_time"] - now) > 5.0:
-            self.remote_midi_queue.pop(0)
+            dropped = self.remote_midi_queue.pop(0)
+            if dropped.get("_rec"):
+                dropped["_rec"]["status"] = "dropped_far_future"
+                self.exp.log_received(dropped["_rec"])
         if not self.remote_midi_queue:
             return
 
@@ -1553,6 +1747,7 @@ class RoomWindow(QWidget):
             user = event["user"]
             stream = event["stream"]
             msg_type = event["type"]
+            send_ms_val = None
             try:
                 if "params" in event:
                     msg = Message(msg_type, **event["params"])
@@ -1570,7 +1765,9 @@ class RoomWindow(QWidget):
                 if vmidi_name and getattr(self.main_app, "vmidi", None):
                     b = msg.bytes()
                     hex_bytes = " ".join(f"{x:02X}" for x in b)
+                    _t_send0 = time.perf_counter()
                     r = self.main_app.vmidi.send_hex(vmidi_name, hex_bytes)
+                    send_ms_val = (time.perf_counter() - _t_send0) * 1000.0
                     print(f"SEND→BRIDGE port={vmidi_name} hex={hex_bytes} result={r}")
                 else:
                     print(
@@ -1578,6 +1775,20 @@ class RoomWindow(QWidget):
 
             except Exception as e:
                 print("⚠️ Scheduled MIDI playback error:", e)
+
+            rec = event.get("_rec")
+            if rec is not None:
+                try:
+                    lateness_ms = (actual_play_ts - event["play_time"]) * 1000.0
+                    delay_ms = float(rec["delay_ms"])
+                    transit_ms = float(rec["transit_est_ms"])
+                    rec["played_s"] = f"{actual_play_ts:.6f}"
+                    rec["lateness_ms"] = f"{lateness_ms:.3f}"
+                    rec["send_ms"] = "" if send_ms_val is None else f"{send_ms_val:.3f}"
+                    rec["eff_delay_ms"] = f"{max(delay_ms, transit_ms + 2.0) + lateness_ms:.3f}"
+                    self.exp.log_received(rec)
+                except Exception as e:
+                    print("⚠️ experiment log error:", e)
     def send_midi(self, note, velocity):
         if not self.main_app.ws:
             return
@@ -1594,6 +1805,8 @@ class RoomWindow(QWidget):
             "tcp_midi": True,
         }
         msg_type = "note_on" if velocity > 0 else "note_off"
+        self.exp.log_sent(self.midi_seq, "gui", msg_type, 0, note, velocity,
+                          midi_event["timestamp"] - self.server_clock_offset)
         self.log_manager.log("MY_MIDI", f"{self.main_app.username}/gui: {msg_type} note={note} vel={velocity}")
         asyncio.get_event_loop().create_task(
             self.main_app.ws.send(json.dumps(midi_event))
@@ -1608,11 +1821,27 @@ class RoomWindow(QWidget):
         app.stream_pretty.pop(key, None)
         app.stream_meta.pop(key, None)
         app.stream_portname.pop(key, None)
-    def update_user_list(self, users):
+    def update_user_list(self, users, ips=None):
         """Synchronize UI with the current list of connected users."""
         self.connected_users = users
         if self.main_app.ws:
             self.send_streams_announce()
+
+        # IP κάθε χρήστη: γράφεται στο log μία φορά, τη στιγμή που εμφανίζεται στο δωμάτιο
+        if ips:
+            self.user_ips.update(ips)
+            for username in users:
+                ip = ips.get(username)
+                if ip and username not in self._logged_ips:
+                    self._logged_ips.add(username)
+                    self.log_manager.log("ROOM", f"🌐 {username} connected from IP {ip}")
+                    lbl = self.user_name_labels.get(username)
+                    if lbl is not None:
+                        lbl.setToolTip(f"IP: {ip}")
+        for username in list(self._logged_ips):
+            if username not in users:
+                self._logged_ips.discard(username)
+                self.user_ips.pop(username, None)
 
         # 1️⃣ Add any new users not yet in the UI
         for username in users:
@@ -1624,6 +1853,7 @@ class RoomWindow(QWidget):
         for username in list(self.user_ui_elements.keys()):
             if username not in users:
                 container = self.user_ui_elements.pop(username)
+                self.user_name_labels.pop(username, None)
                 container.setParent(None)
                 container.deleteLater()
                 if hasattr(self, "log_manager"):
@@ -1692,6 +1922,10 @@ class RoomWindow(QWidget):
 
         name_label = QtWidgets.QLabel(username)
         top_row.addWidget(name_label)
+        self.user_name_labels[username] = name_label
+        if self.user_ips.get(username):
+            name_label.setToolTip(f"IP: {self.user_ips[username]}")
+        container.setMinimumWidth(240)   # ώστε οι χρήστες δίπλα-δίπλα να μην στριμώχνονται
 
         top_row.addStretch(1)
 
@@ -2000,16 +2234,15 @@ class RoutingManager(QDialog):
         table.verticalHeader().setDefaultSectionSize(32)
         table.verticalHeader().hide()
 
-        table.setColumnCount(5)
+        table.setColumnCount(4)
         table.setHorizontalHeaderLabels(
-            ["Type", "User / Device", "Stream / Port", "Virtual MIDI Port", "Active"]
+            ["Type", "User / Device", "Stream / Port", "Active"]
         )
         header = table.horizontalHeader()
         header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)  # Type
-        header.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)  # User/Device
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)  # User/Device (όνομα πόρτας)
         header.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)  # Stream/Port
-        header.setSectionResizeMode(3, QtWidgets.QHeaderView.Stretch)  # Virtual MIDI Port
-        header.setSectionResizeMode(4, QtWidgets.QHeaderView.ResizeToContents)  # Active
+        header.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)  # Active
 
         self.ui.okButton.clicked.connect(self.apply_changes)
         self.ui.refreshButton.clicked.connect(self.on_refresh)
@@ -2079,23 +2312,20 @@ class RoutingManager(QDialog):
             item_dev.setFlags(item_dev.flags() & ~QtCore.Qt.ItemIsEditable)
             table.setItem(row, 1, item_dev)
 
-            # Col 2: stream_id αν είναι ανοιχτή
+            # Col 2: Stream / Port — ίδια λογική με τους remote ("User — Device")
             stream_id = ""
             if self.room_window:
                 for sid, dname in self.room_window.stream_devices.items():
                     if dname == dev_name:
                         stream_id = sid
                         break
-            item_stream = QtWidgets.QTableWidgetItem(stream_id if stream_id else "—")
+            item_stream = QtWidgets.QTableWidgetItem(f"{me} — {disp_name}")
             item_stream.setFlags(item_stream.flags() & ~QtCore.Qt.ItemIsEditable)
+            if stream_id:
+                item_stream.setToolTip(f"stream id: {stream_id}")
             table.setItem(row, 2, item_stream)
 
-            # Col 3: N/A για local
-            item_out = QtWidgets.QTableWidgetItem("(local input)")
-            item_out.setFlags(item_out.flags() & ~QtCore.Qt.ItemIsEditable)
-            table.setItem(row, 3, item_out)
-
-            # Col 4: Active checkbox
+            # Col 3: Active checkbox
             chk = QtWidgets.QCheckBox()
             chk.blockSignals(True)  # μην πυροδοτείς signal κατά το setChecked
             chk.setChecked(dev_name in selected or base_name(dev_name) in selected_bases)
@@ -2106,7 +2336,7 @@ class RoutingManager(QDialog):
             layout.addWidget(chk)
             layout.setAlignment(QtCore.Qt.AlignCenter)
             layout.setContentsMargins(0, 0, 0, 0)
-            table.setCellWidget(row, 4, cell_widget)
+            table.setCellWidget(row, 3, cell_widget)
 
         # ── ΤΜΗΜΑ Β: Remote peers ──────────────────────────────────────
         seen = set(getattr(self.main_app, "seen_streams", set()))
@@ -2129,9 +2359,13 @@ class RoutingManager(QDialog):
             item_type.setFlags(item_type.flags() & ~QtCore.Qt.ItemIsEditable)
             table.setItem(row, 0, item_type)
 
-            # Col 1: User
-            item_user = QtWidgets.QTableWidgetItem(user)
+            # Col 1: User / Device — το όνομα της πόρτας στην οποία λαμβάνω, όπως φαίνεται στο σύστημά μου
+            route = routing.get(key, {})
+            assigned = route.get("vmidi", "")
+            port_text = assigned if assigned else "(allocating...)"
+            item_user = QtWidgets.QTableWidgetItem(port_text)
             item_user.setFlags(item_user.flags() & ~QtCore.Qt.ItemIsEditable)
+            item_user.setToolTip(f"Remote user: {user}")
             table.setItem(row, 1, item_user)
 
             # Col 2: Stream pretty name
@@ -2143,19 +2377,11 @@ class RoutingManager(QDialog):
                 item_stream.setToolTip("🔒 Auto-allocated")
             table.setItem(row, 2, item_stream)
 
-            # Col 3: Virtual MIDI port name
-            route = routing.get(key, {})
-            assigned = route.get("vmidi", "")
-            out_text = assigned if assigned else "(allocating...)"
-            item_out = QtWidgets.QTableWidgetItem(out_text)
-            item_out.setFlags(item_out.flags() & ~QtCore.Qt.ItemIsEditable)
-            table.setItem(row, 3, item_out)
-
-            # Col 4: Active — πάντα ✓ για remote (δεν μπορείς να τα κλείσεις χειροκίνητα)
+            # Col 3: Active — πάντα ✓ για remote (δεν μπορείς να τα κλείσεις χειροκίνητα)
             item_active = QtWidgets.QTableWidgetItem("✓")
             item_active.setFlags(item_active.flags() & ~QtCore.Qt.ItemIsEditable)
             item_active.setTextAlignment(QtCore.Qt.AlignCenter)
-            table.setItem(row, 4, item_active)
+            table.setItem(row, 3, item_active)
 
     def toggle_local_device(self, dev_name: str, state: int):
         """Καταγράφει μόνο την επιλογή. Εφαρμόζεται όταν πατηθεί OK."""
@@ -2231,10 +2457,11 @@ class LogSettingsDialog(QtWidgets.QDialog):
 
         # File controls
         file_row = QtWidgets.QHBoxLayout()
-        self.file_btn = QtWidgets.QPushButton("Start Saving to CSV...")
+        self.file_btn = QtWidgets.QPushButton("Stop Saving" if self.lm.file_enabled else "Start Saving to CSV...")
         self.file_btn.clicked.connect(self.toggle_file)
         file_row.addWidget(self.file_btn)
-        self.file_label = QtWidgets.QLabel("(no file)")
+        import os as _os
+        self.file_label = QtWidgets.QLabel(_os.path.basename(self.lm.file_path) if (self.lm.file_enabled and self.lm.file_path) else "(no file)")
         file_row.addWidget(self.file_label)
         layout.addLayout(file_row)
 
@@ -2309,6 +2536,18 @@ class LogSettingsDialog(QtWidgets.QDialog):
                 self.file_btn.setText("Stop Saving")
                 self.file_label.setText(fname.split("/")[-1])
 
+    def sync_peers(self):
+        """Προσθέτει/αφαιρεί γραμμές peers χωρίς να χαθούν οι μη εφαρμοσμένες αλλαγές."""
+        for peer, route in self.lm.peer_routing.items():
+            if ("peer", peer) not in self.pending:
+                self.pending[("peer", peer)] = dict(route)
+        for key in [k for k in self.pending if k[0] == "peer" and k[1] not in self.lm.peer_routing]:
+            del self.pending[key]
+        self.refresh_table()
+
+    def _detach_listener(self, *_):
+        self.lm.peer_listener = None
+
 class RoomSettingsWindow(QMainWindow):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2344,18 +2583,6 @@ class RoomSettingsWindow(QMainWindow):
             asyncio.get_event_loop().create_task(self.parent().room_window.start_webrtc())
 
         self.close()
-
-    def sync_peers(self):
-        """Προσθέτει/αφαιρεί γραμμές peers χωρίς να χαθούν οι μη εφαρμοσμένες αλλαγές."""
-        for peer, route in self.lm.peer_routing.items():
-            if ("peer", peer) not in self.pending:
-                self.pending[("peer", peer)] = dict(route)
-        for key in [k for k in self.pending if k[0] == "peer" and k[1] not in self.lm.peer_routing]:
-            del self.pending[key]
-        self.refresh_table()
-
-    def _detach_listener(self, *_):
-        self.lm.peer_listener = None
 
 class MidiUserApp(QMainWindow):
     def __init__(self):
@@ -2759,7 +2986,7 @@ class MidiUserApp(QMainWindow):
                             users = data.get("users", [])
                             if self.room_window:
                                 # Update current connected users
-                                self.room_window.update_user_list(users)
+                                self.room_window.update_user_list(users, data.get("ips"))
 
                                 # If I'm the creator and a peer is present, kick off the offer once.
                                 if self.room_window.is_creator and not self.room_window.offer_sent and len(users) >= 2:

@@ -266,6 +266,27 @@ def display_name(real_name):
     return re.sub(r"\s+\d+$", "", (real_name or "").strip())
 
 
+# --- Loopback endpoints που δημιουργεί ο χρήστης (MIDI Port Manager) ---------------------------
+# Κάθε loopback είναι ζεύγος: "<όνομα> (A)" = εκεί στέλνει MIDI η εξωτερική εφαρμογή/DAW (output),
+# "<όνομα> (B)" = από εκεί διαβάζει το MIDIRooms (input). Ό,τι γράφεται στο (A) βγαίνει στο (B).
+LB_SEND_SUFFIX = " (A)"
+LB_RECV_SUFFIX = " (B)"
+LB_NAME_MAX = 31 - max(len(LB_SEND_SUFFIX), len(LB_RECV_SUFFIX))   # 27: το όνομα + κατάληξη χωράει στα 31 του WinMM
+USER_LOOPBACKS_FILE = "user_loopbacks.json"
+
+
+def loopback_role(real_name, loopbacks):
+    """('recv'|'send', όνομα_loopback) αν το port ανήκει σε loopback που δημιούργησε ο χρήστης, αλλιώς None."""
+    n = re.sub(r"\s+\d+$", "", (real_name or "").strip()).lower()
+    for lb in loopbacks:
+        l = lb.lower()
+        if n == l + LB_RECV_SUFFIX.lower():
+            return "recv", lb
+        if n == l + LB_SEND_SUFFIX.lower():
+            return "send", lb
+    return None
+
+
 def is_internal_port(name):
     """True για τα virtual ports της ίδιας της εφαρμογής (_MR_0001, _MR_METRONOME, ...)."""
     return display_name(name).upper().startswith(PORT_PREFIX)
@@ -407,6 +428,15 @@ class VirtualMidiBridge:
             return False
         time.sleep(settle)
         return True
+
+    def create_pair(self, name: str, suffix_a: str, suffix_b: str, settle: float = 0.5) -> str:
+        """Ζεύγος με δικές μας καταλήξεις. Επιστρέφει την απάντηση του helper:
+        'OK sfx' = δημιουργήθηκε με τις καταλήξεις μας· 'OK' = παλιός helper (έφτιαξε (MR)/(DAW))."""
+        resp = self._cmd(f"CREATE|{name}|{suffix_a}|{suffix_b}", timeout=6.0)
+        print(f"CREATE '{name}' [{suffix_a}/{suffix_b}] → reply: {resp!r}")
+        if resp.startswith("OK"):
+            time.sleep(settle)
+        return resp
 
     def close(self, name: str) -> bool:
         # close Python-side mido output first
@@ -782,6 +812,10 @@ class RoomWindow(QWidget):
             return None
 
 
+    def _peer_device_name(self, dev_name):
+        """Όνομα συσκευής όπως το βλέπουν οι άλλοι (για loopback του χρήστη με την πλευρά, π.χ. 'Jam Pad (B)')."""
+        return display_name(dev_name)
+
     def send_streams_announce(self):
         if not self.main_app.ws:
             return
@@ -789,12 +823,12 @@ class RoomWindow(QWidget):
 
         if getattr(self, "stream_devices", None):
             for stream_id, dev_name in self.stream_devices.items():
-                streams.append({"stream": stream_id, "device": display_name(dev_name)})
+                streams.append({"stream": stream_id, "device": self._peer_device_name(dev_name)})
         else:
             selected_inputs = getattr(self.main_app, "selected_inputs", []) or []
             for idx, dev_name in enumerate(selected_inputs, start=1):
                 stream_id = self.main_app.make_stream_id(dev_name, idx)
-                streams.append({"stream": stream_id, "device": display_name(dev_name)})
+                streams.append({"stream": stream_id, "device": self._peer_device_name(dev_name)})
 
         self.send_to_room({
             "type": "streams_announce",
@@ -2244,6 +2278,21 @@ class RoutingManager(QDialog):
         header.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)  # Stream/Port
         header.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)  # Active
 
+        table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self._sel_syncing = False
+        table.itemSelectionChanged.connect(self._on_selection_changed)
+
+        # κουμπιά για τα loopback endpoints (αριστερά, πριν το spacer)
+        self.createLbButton = QtWidgets.QPushButton("Create Endpoint Pair")
+        self.deleteLbButton = QtWidgets.QPushButton("Delete Endpoint Pair")
+        self.deleteLbButton.setEnabled(False)
+        self.deleteLbButton.setToolTip("Select a 🔁 Loopback row to delete the endpoint pair")
+        self.ui.horizontalLayout.insertWidget(0, self.createLbButton)
+        self.ui.horizontalLayout.insertWidget(1, self.deleteLbButton)
+        self.createLbButton.clicked.connect(self.create_loopback)
+        self.deleteLbButton.clicked.connect(self.delete_loopback)
+
         self.ui.okButton.clicked.connect(self.apply_changes)
         self.ui.refreshButton.clicked.connect(self.on_refresh)
         self.ui.cancelButton.clicked.connect(self.reject)
@@ -2297,18 +2346,28 @@ class RoutingManager(QDialog):
         selected = set(self.pending)
         selected_bases = {base_name(x) for x in selected}
 
+        loopbacks = list(getattr(self.main_app, "user_loopbacks", []))
+
         for disp_name, dev_name in device_choices(physical_inputs):
+            role = loopback_role(dev_name, loopbacks)      # και οι δύο πλευρές (A)/(B) εμφανίζονται ξεχωριστά
+            lb_name = role[1] if role else None
+
             row = table.rowCount()
             table.insertRow(row)
 
             # Col 0: Type
-            item_type = QtWidgets.QTableWidgetItem("🎹 Local")
+            item_type = QtWidgets.QTableWidgetItem("🔁 Loopback" if lb_name else "🎹 Local")
             item_type.setFlags(item_type.flags() & ~QtCore.Qt.ItemIsEditable)
             table.setItem(row, 0, item_type)
 
             # Col 1: Device name
             item_dev = QtWidgets.QTableWidgetItem(disp_name)
             item_dev.setData(QtCore.Qt.UserRole, dev_name)
+            item_dev.setData(QtCore.Qt.UserRole + 1, lb_name)     # μη-κενό μόνο για loopback του χρήστη
+            if lb_name:
+                other = lb_name + (LB_RECV_SUFFIX if role[0] == "send" else LB_SEND_SUFFIX)
+                item_dev.setToolTip(f"Endpoint pair '{lb_name}'. If MIDIRooms reads this side, "
+                                    f"send MIDI from your DAW/app to the OUTPUT port '{other}'.")
             item_dev.setFlags(item_dev.flags() & ~QtCore.Qt.ItemIsEditable)
             table.setItem(row, 1, item_dev)
 
@@ -2383,6 +2442,82 @@ class RoutingManager(QDialog):
             item_active.setTextAlignment(QtCore.Qt.AlignCenter)
             table.setItem(row, 3, item_active)
 
+        self._update_delete_button()
+
+    def _selected_loopback(self):
+        """Το όνομα του επιλεγμένου loopback του χρήστη, ή None."""
+        table = self.ui.routingTable
+        for idx in table.selectionModel().selectedRows():
+            item = table.item(idx.row(), 1)
+            lb = item.data(QtCore.Qt.UserRole + 1) if item else None
+            if lb:
+                return lb
+        return None
+
+    def _on_selection_changed(self):
+        """Όταν επιλέγεται η μία πλευρά ενός ζεύγους, επιλέγεται και η άλλη (ώστε το Delete να τα διαγράφει μαζί)."""
+        if self._sel_syncing:
+            return
+        table = self.ui.routingTable
+        sm = table.selectionModel()
+        selected = {i.row() for i in sm.selectedRows()}
+        names = set()
+        for r in selected:
+            it = table.item(r, 1)
+            lb = it.data(QtCore.Qt.UserRole + 1) if it else None
+            if lb:
+                names.add(lb)
+        if names:
+            self._sel_syncing = True
+            try:
+                for r in range(table.rowCount()):
+                    it = table.item(r, 1)
+                    if it and it.data(QtCore.Qt.UserRole + 1) in names and r not in selected:
+                        sm.select(table.model().index(r, 0),
+                                  QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
+            finally:
+                self._sel_syncing = False
+        self._update_delete_button()
+
+    def _update_delete_button(self):
+        self.deleteLbButton.setEnabled(bool(self._selected_loopback()))
+
+    def create_loopback(self):
+        dlg = CreateLoopbackDialog(self.main_app, self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        name = dlg.created_name
+        self.refresh_table()
+        QtCore.QTimer.singleShot(800, self.refresh_table)      # το WinMM χρειάζεται λίγο να το δει
+
+    def delete_loopback(self):
+        name = self._selected_loopback()
+        if not name:
+            return
+        if QMessageBox.question(
+                self, "Delete Endpoint Pair",
+                f"Delete the endpoint pair '{name}'?\nIt is removed from the room and from Windows.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+
+        mine = [name]
+        used = [d for d in list(self.pending) + list(getattr(self.main_app, "selected_inputs", []) or [])
+                if loopback_role(d, mine)]
+        self.pending = {x for x in self.pending if not loopback_role(x, mine)}
+        self.main_app.selected_inputs = [x for x in (getattr(self.main_app, "selected_inputs", []) or [])
+                                         if not loopback_role(x, mine)]
+        room_win = getattr(self.main_app, "room_window", None)
+        if room_win:
+            for d in used:
+                self._close_device(room_win, d)
+            room_win.send_streams_announce()
+        for k in [k for k in list(_open_inputs) if loopback_role(k, mine)]:
+            safe_close_port(_open_inputs.get(k), k)       # κλείνει και το cache αν έμεινε ανοιχτό
+
+        self.main_app.delete_user_loopback(name)
+        QtCore.QTimer.singleShot(300, self.refresh_table)
+        self.refresh_table()
+
     def toggle_local_device(self, dev_name: str, state: int):
         """Καταγράφει μόνο την επιλογή. Εφαρμόζεται όταν πατηθεί OK."""
         self.pending = {x for x in self.pending if base_name(x) != base_name(dev_name)}
@@ -2427,6 +2562,38 @@ class RoutingManager(QDialog):
         force_winmm_refresh()  # ώστε το WinMM να ξαναδεί τις συσκευές
         self.main_app.refresh_midi_state()
         self.refresh_table()
+
+
+class CreateLoopbackDialog(QtWidgets.QDialog):
+    """Ζητά όνομα και δημιουργεί loopback endpoint (OK / Cancel)."""
+    def __init__(self, main_app, parent=None):
+        super().__init__(parent)
+        self.main_app = main_app
+        self.created_name = None
+        self.setWindowTitle("Create Endpoint Pair")
+        self.setMinimumWidth(380)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.addWidget(QtWidgets.QLabel("Name of the new endpoint pair:"))
+        self.edit = QtWidgets.QLineEdit()
+        self.edit.setMaxLength(LB_NAME_MAX)
+        self.edit.setPlaceholderText("e.g. Jam Pad")
+        lay.addWidget(self.edit)
+        hint = QtWidgets.QLabel(f"English letters, digits, space, _ and - (max {LB_NAME_MAX} characters)")
+        hint.setStyleSheet("color: gray;")
+        lay.addWidget(hint)
+        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        btns.accepted.connect(self._on_ok)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+        self.edit.setFocus()
+
+    def _on_ok(self):
+        ok, result = self.main_app.create_user_loopback(self.edit.text())
+        if not ok:
+            QMessageBox.warning(self, "Create Endpoint Pair", result)
+            return                       # μένει ανοιχτό για διόρθωση
+        self.created_name = result
+        self.accept()
 
 
 class LogSettingsDialog(QtWidgets.QDialog):
@@ -2621,6 +2788,7 @@ class MidiUserApp(QMainWindow):
         # ---- virtualMIDI bridge ----
         self.vmidi = None
         self.created_vmidi_ports = set()  # all ports created via bridge (local + remote)
+        self.user_loopbacks = []          # loopback endpoints που δημιούργησε ο χρήστης (μόνο τα ονόματα)
         self.vmidi_pool = []              # τα remote slots (ports) που δημιουργήθηκαν στην εκκίνηση
         self.metronome_port_name = None
         self.pid = os.getpid()
@@ -2735,9 +2903,92 @@ class MidiUserApp(QMainWindow):
             else:
                 print(f"❌ Could not create pool port #{i}")
 
+        for lb in self._load_user_loopbacks():
+            if lb not in self.user_loopbacks and "sfx" in self.vmidi.create_pair(lb, LB_SEND_SUFFIX, LB_RECV_SUFFIX, settle=0.2):
+                self.user_loopbacks.append(lb)
+                print(f"✅ User loopback restored: {lb}")
+            else:
+                print(f"❌ Could not restore user loopback: {lb}")
+
         self._pool_ready = True
         self._load_sticky()
         print(f"✅ vmidi pool ready: {self.vmidi_pool}")
+
+    # ---- Loopback endpoints του χρήστη ------------------------------------------------------
+    def _user_loopbacks_path(self):
+        import os
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), USER_LOOPBACKS_FILE)
+
+    def _load_user_loopbacks(self):
+        try:
+            with open(self._user_loopbacks_path(), "r", encoding="utf-8") as f:
+                names = json.load(f)
+            return [n for n in names if isinstance(n, str) and n]
+        except FileNotFoundError:
+            return []
+        except Exception as e:
+            print("⚠️ user loopbacks load failed:", e)
+            return []
+
+    def _save_user_loopbacks(self):
+        try:
+            with open(self._user_loopbacks_path(), "w", encoding="utf-8") as f:
+                json.dump(self.user_loopbacks, f, ensure_ascii=False)
+        except Exception as e:
+            print("⚠️ user loopbacks save failed:", e)
+
+    def validate_loopback_name(self, raw):
+        """Επιστρέφει (καθαρό_όνομα, None) ή (None, μήνυμα_σφάλματος)."""
+        name = re.sub(r"\s+", " ", (raw or "").strip())
+        if not name:
+            return None, "Please enter a name."
+        if len(name) > LB_NAME_MAX:
+            return None, f"The name is too long (max {LB_NAME_MAX} characters)."
+        if not re.fullmatch(r"[A-Za-z0-9 _\-]+", name):
+            return None, "Use only English letters, digits, spaces, '_' and '-'."
+        if name.upper().startswith(PORT_PREFIX):
+            return None, f"Names starting with {PORT_PREFIX} are reserved."
+        low = name.lower()
+        taken = {x.lower() for x in self.user_loopbacks} | {x.lower() for x in self.created_vmidi_ports}
+        try:
+            taken |= {display_name(n).lower() for n in mido.get_input_names()}
+        except Exception:
+            pass
+        if low in taken:
+            return None, "This name is already in use."
+        return name, None
+
+    def create_user_loopback(self, raw):
+        """Δημιουργεί loopback endpoint. Επιστρέφει (True, όνομα) ή (False, μήνυμα)."""
+        name, err = self.validate_loopback_name(raw)
+        if err:
+            return False, err
+        self.ensure_vmidi_bridge()
+        if not getattr(self, "vmidi", None):
+            return False, "The MIDI helper is not running."
+        resp = self.vmidi.create_pair(name, LB_SEND_SUFFIX, LB_RECV_SUFFIX, settle=0.5)
+        if not resp.startswith("OK"):
+            return False, "Windows MIDI Services could not create the endpoint pair (see the log of the helper)."
+        if resp.startswith("OK exists"):
+            return False, "This name is already in use."
+        if "sfx" not in resp:
+            self.vmidi.close(name)          # ο παλιός helper έφτιαξε ζεύγος (MR)/(DAW): το αφαιρούμε
+            return False, "The wms helper is outdated. Rebuild it (dotnet publish) and copy it to the wms folder."
+        self.user_loopbacks.append(name)
+        self._save_user_loopbacks()
+        print(f"✅ User loopback created: {name}")
+        return True, name
+
+    def delete_user_loopback(self, name):
+        if name not in self.user_loopbacks:
+            return False
+        ok = True
+        if getattr(self, "vmidi", None):
+            ok = self.vmidi.close(name)
+        self.user_loopbacks.remove(name)
+        self._save_user_loopbacks()
+        print(f"♻️ User loopback deleted: {name} (helper ok={ok})")
+        return ok
 
     STICKY_FILE = "sticky_ports.json"
 

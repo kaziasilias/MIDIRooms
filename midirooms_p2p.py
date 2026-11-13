@@ -1,0 +1,4085 @@
+# mainappvolume2.py
+import sys, asyncio, json, time
+from PyQt5 import QtWidgets, QtCore
+from PyQt5.QtWidgets import QApplication, QMainWindow, QMessageBox, QWidget
+from midiuser_ui import Ui_MainWindow
+from midisettings_ui import Ui_Form as Ui_SettingsForm
+from roomform_ui import Ui_roomwindow
+from roomsettings_ui import Ui_roomSettingsWindow
+from routingmanager_ui import Ui_routingDialog
+from PyQt5.QtWidgets import QDialog, QComboBox, QSpinBox
+import mido
+import time
+import statistics
+import re
+from PyQt5.QtWidgets import QPushButton, QHBoxLayout, QWidget
+from mido import Message
+import websockets
+import csv
+from datetime import datetime
+from qasync import QEventLoop
+import uuid, types
+from collections import OrderedDict, deque
+try:
+    from aiortc import RTCPeerConnection, RTCConfiguration, RTCIceServer, RTCSessionDescription
+    P2P_AVAILABLE = True
+except Exception as _p2p_err:          # χωρίς aiortc η εφαρμογή δουλεύει μόνο μέσω server (relay)
+    P2P_AVAILABLE = False
+    print("⚠️ aiortc not available — P2P disabled, server relay only:", _p2p_err)
+
+# ---- P2P ρυθμίσεις ----
+P2P_ENABLED = True              # False => μόνο relay μέσω server (όπως το midirooms.py)
+P2P_CONNECT_TIMEOUT_S = 10      # αν δεν ανοίξει το DataChannel μέσα σε τόσο, το ζευγάρι πάει σε relay μέσω server
+P2P_RETRY_AT_S = 4              # ένα δεύτερο offer, αν χάθηκε το πρώτο (π.χ. ο άλλος δεν ήταν έτοιμος)
+P2P_MAX_ACK_AGE_S = 3.0         # αν ένα event μένει τόσο χωρίς ack, το link θεωρείται χαλασμένο (πριν: 1,5 s)
+P2P_HEDGE_S = 0.3               # event χωρίς ack για τόσο => στέλνεται ΚΑΙ μέσω server (ο παραλήπτης κρατά το πρώτο που φτάνει).
+                                # None = απενεργοποιημένο
+P2P_RECONNECT_DELAYS_S = (5, 10, 20, 40, 60)   # αναμονή πριν από κάθε νέα προσπάθεια P2P μετά από πτώση (μετά: 60 s)
+P2P_RECONNECT_MAX = 12          # μέγιστες προσπάθειες επανασύνδεσης ανά ζευγάρι
+P2P_STATS_EVERY_S = 2.0         # διαγνωστικά στο log: στατιστικά του link κάθε τόσα δευτερόλεπτα (όταν υπάρχει κίνηση)
+P2P_STALL_LOG_S = 0.4           # ... και άμεσα όταν ένα event μένει χωρίς ack περισσότερο από αυτό
+
+
+def _p2p_ice_config():
+    return RTCConfiguration(iceServers=[
+        RTCIceServer(urls=["stun:stun.l.google.com:19302"]),
+        RTCIceServer(urls=["stun:stun1.l.google.com:19302"]),
+    ])
+
+
+def _p2p_sdp_candidates(sdp):
+    """Από ένα SDP: λίστα 'τύπος ip:port' των ICE candidates (host / srflx / relay)."""
+    out = []
+    for ln in (sdp or "").splitlines():
+        if ln.startswith("a=candidate:"):
+            p = ln[2:].split()
+            try:
+                out.append(f"{p[7]} {p[4]}:{p[5]}")
+            except IndexError:
+                pass
+    return out
+
+
+def _p2p_selected_pair(pc):
+    """Η διαδρομή που διάλεξε το ICE (best effort: οι εσωτερικές δομές του aiortc/aioice αλλάζουν ανά έκδοση)."""
+    try:
+        conn = pc.sctp.transport.transport._connection
+        nom = getattr(conn, "_nominated", None) or {}
+        pair = nom.get(1) or next(iter(nom.values()), None)
+        if pair is None:
+            return None
+        lc, rc = pair.local_candidate, pair.remote_candidate
+        return f"{lc.type} {lc.host}:{lc.port} <-> {rc.type} {rc.host}:{rc.port}"
+    except Exception:
+        return None
+
+
+def _p2p_sctp_info(pc):
+    """Εσωτερικά του SCTP (best effort): cwnd / bytes σε πτήση / rto — για να φανεί αν το κανάλι «κολλά»."""
+    try:
+        sctp = pc.sctp
+        parts = []
+        for attr, name in (("_cwnd", "cwnd"), ("_flight_size", "flight"), ("_rto", "rto")):
+            v = getattr(sctp, attr, None)
+            if v is not None:
+                parts.append(f"{name}={v:.2f}" if isinstance(v, float) else f"{name}={v}")
+        return " ".join(parts)
+    except Exception:
+        return ""
+#from aiortc import RTCPeerConnection, RTCConfiguration, RTCIceServer, RTCSessionDescription
+from username import Ui_Form as Ui_UsernameForm
+
+# WebRTC signaling server
+SIGNALING_SERVER = "ws://155.207.200.166:8080/ws"  # change to your VPS
+
+
+import subprocess, threading, queue
+
+import csv as _csv_module
+from datetime import datetime as _dt
+
+class ExperimentRecorder:
+    """
+    Καταγραφή μετρήσεων ανά νότα, ένα ζευγάρι αρχείων ανά "run" (Start/Stop από το checkbox Record CSV):
+      experiment_RECEIVED_<user>_<tag>_<ώρα>.csv : μία γραμμή ανά νότα που ΠΑΙΧΤΗΚΕ στον παραλήπτη
+      experiment_SENT_<user>_<tag>_<ώρα>.csv     : μία γραμμή ανά μήνυμα που ΣΤΑΛΘΗΚΕ (για ανίχνευση απώλειας)
+
+    Στήλες RECEIVED:
+      seq, user, stream, type, ch, note, vel
+      arrival_s        : perf_counter τη στιγμή που ήρθε το μήνυμα στην εφαρμογή
+      sender_ts_s      : timestamp αποστολέα μεταφερμένο στο τοπικό ρολόι (με το offset από τον server)
+      transit_est_ms   : arrival - sender_ts   (ΠΡΙΝ το buffer, εκτίμηση: εξαρτάται από το clock offset)
+      buf_base_ms, buf_extra_ms, delay_ms : buffer που εφαρμόστηκε (delay = base + extra)
+      slack_ms         : (buffer ΠΡΙΝ την ανύψωση) - transit_est_ms  (αρνητικό = ήρθε αργά)
+      late             : 1 αν η νότα ήρθε αργά (play_time < now + 2 ms), αλλιώς 0
+      play_time_s      : προγραμματισμένη στιγμή αναπαραγωγής
+      played_s         : πραγματική στιγμή αναπαραγωγής
+      lateness_ms      : played - play_time
+      send_ms          : διάρκεια της κλήσης προς τη virtual θύρα
+      eff_delay_ms     : max(delay, transit + 2) + lateness
+      adaptive, server_offset_ms, server_jitter_ms
+    """
+    RECV_COLS = ["seq", "user", "stream", "type", "ch", "note", "vel",
+                 "arrival_s", "sender_ts_s", "transit_est_ms",
+                 "buf_base_ms", "buf_extra_ms", "delay_ms", "slack_ms", "late",
+                 "play_time_s", "played_s", "lateness_ms", "send_ms", "eff_delay_ms",
+                 "adaptive", "server_offset_ms", "server_jitter_ms", "status", "via"]
+    SENT_COLS = ["seq", "stream", "type", "ch", "note", "vel", "send_ts_s", "input_ts"]
+
+    def __init__(self):
+        self.active = False
+        self._rf = self._sf = None
+        self._rw = self._sw = None
+        self.recv_path = self.sent_path = None
+        self.n_recv = 0
+        self.n_sent = 0
+
+    def start(self, username, tag):
+        if self.active:
+            return
+        stamp = _dt.now().strftime("%Y%m%d_%H%M%S")
+        base = f"{username}_{tag}_{stamp}"
+        self.recv_path = f"experiment_RECEIVED_{base}.csv"
+        self.sent_path = f"experiment_SENT_{base}.csv"
+        self._rf = open(self.recv_path, "w", newline="", encoding="utf-8")
+        self._sf = open(self.sent_path, "w", newline="", encoding="utf-8")
+        self._rw = _csv_module.writer(self._rf)
+        self._sw = _csv_module.writer(self._sf)
+        self._rw.writerow(self.RECV_COLS)
+        self._sw.writerow(self.SENT_COLS)
+        self.n_recv = self.n_sent = 0
+        self.active = True
+        print(f"📝 Experiment CSV: {self.recv_path} + {self.sent_path}")
+
+    def stop(self):
+        if not self.active:
+            return
+        self.active = False
+        for f in (self._rf, self._sf):
+            try:
+                f.flush()
+                f.close()
+            except Exception:
+                pass
+        print(f"📝 Experiment CSV closed: {self.n_recv} received, {self.n_sent} sent")
+        self._rf = self._sf = self._rw = self._sw = None
+
+    def log_sent(self, seq, stream, msg_type, ch, note, vel, send_ts, input_ts=None):
+        if not self.active:
+            return
+        try:
+            self._sw.writerow([seq, stream, msg_type, ch, note, vel,
+                               f"{send_ts:.6f}", "" if input_ts is None else input_ts])
+            self.n_sent += 1
+        except Exception:
+            pass
+
+    def log_received(self, rec):
+        """rec: dict με τα κλειδιά του RECV_COLS (όσα λείπουν γράφονται κενά)."""
+        if not self.active:
+            return
+        try:
+            self._rw.writerow([rec.get(c, "") for c in self.RECV_COLS])
+            self.n_recv += 1
+            if self.n_recv % 50 == 0:
+                self._rf.flush()
+                self._sf.flush()
+        except Exception:
+            pass
+
+
+class LogManager:
+    """
+    Κεντρικό σύστημα logging με κατηγορίες και 3 προορισμούς:
+    cmd (console), room (UI log), file (CSV για ανάλυση).
+    Κάθε κατηγορία μπορεί να ενεργοποιηθεί/απενεργοποιηθεί ανά προορισμό.
+    """
+    # Στατικές κατηγορίες
+    CATEGORIES = ["MY_MIDI", "CLOCK", "DEVICE", "ROOM", "SYSTEM", "ERROR"]
+
+    def __init__(self, room_window):
+        self.room_window = room_window
+
+        # routing[category][destination] = True/False
+        # destinations: "cmd", "room", "file"
+        self.routing = {}
+        for cat in self.CATEGORIES:
+            self.routing[cat] = {"cmd": True, "room": True, "file": True}   # file=True: αποθήκευση σε CSV από προεπιλογή
+
+        # δυναμικές κατηγορίες ανά peer: "PEER:<username>"
+        self.peer_routing = {}  # username -> {"cmd":bool,"room":bool,"file":bool}
+        self.peer_listener = None  # καλείται όταν προστίθεται/αφαιρείται peer
+        # CSV file
+        self.csv_file = None
+        self.csv_writer = None
+        self.file_enabled = False
+        self.file_path = None
+
+    # ---- διαχείριση peer κατηγοριών ----
+    def ensure_peer(self, username):
+        if username not in self.peer_routing:
+            self.peer_routing[username] = {"cmd": True, "room": True, "file": True}
+            if self.peer_listener:
+                self.peer_listener()
+
+    def remove_peer(self, username):
+        if self.peer_routing.pop(username, None) is not None and self.peer_listener:
+            self.peer_listener()
+
+    # ---- CSV file control ----
+    def start_file(self, filepath):
+        try:
+            self.csv_file = open(filepath, "w", newline="", encoding="utf-8")
+            self.csv_writer = _csv_module.writer(self.csv_file)
+            self.csv_writer.writerow(["timestamp", "category", "message"])
+            self.file_path = filepath
+            self.file_enabled = True
+            self.log("SYSTEM", f"📝 Logging to file: {filepath}")
+        except Exception as e:
+            print(f"⚠️ Could not open log file: {e}")
+            self.file_enabled = False
+
+    def stop_file(self):
+        self.file_enabled = False
+        try:
+            if self.csv_file:
+                self.csv_file.close()
+        except Exception:
+            pass
+        self.csv_file = None
+        self.csv_writer = None
+        self.file_path = None
+
+    # ---- κύρια μέθοδος logging ----
+    def log(self, category, message, peer=None):
+        """
+        category: μία από τις CATEGORIES, ή None αν είναι peer message
+        peer: username αν το μήνυμα αφορά συγκεκριμένο peer (PEER_MIDI)
+        """
+        if peer is not None:
+            self.ensure_peer(peer)
+            route = self.peer_routing.get(peer, {"cmd": True, "room": True, "file": True})
+            cat_label = f"PEER:{peer}"
+        else:
+            route = self.routing.get(category, {"cmd": True, "room": True, "file": True})
+            cat_label = category
+
+        # 1) console
+        if route.get("cmd", False):
+            print(f"[{cat_label}] {message}")
+
+        # 2) room log (UI)
+        if route.get("room", False):
+            try:
+                self.room_window.ui.logArea.append(message)
+            except Exception:
+                pass
+
+        # 3) file (CSV)
+        if route.get("file", False) and self.file_enabled and self.csv_writer:
+            try:
+                ts = _dt.now().strftime("%H:%M:%S.%f")[:-3]
+                self.csv_writer.writerow([ts, cat_label, message])
+                self.csv_file.flush()
+            except Exception:
+                pass
+def force_winmm_refresh():
+    """
+    Αναγκάζει το Windows WinMM να ξανακαταγράψει τις MIDI συσκευές.
+    Χρειάζεται μόνο σε Windows — σε άλλα OS δεν κάνει τίποτα.
+    """
+    try:
+        import ctypes
+        winmm = ctypes.windll.winmm
+        # Στέλνουμε WM_DEVICECHANGE μήνυμα για να αναγκάσουμε re-enumeration
+        # Ο πιο αξιόπιστος τρόπος είναι να ανοίξουμε και να κλείσουμε ένα dummy port
+        # ώστε το WinMM να ανανεώσει το internal cache
+        count = winmm.midiInGetNumDevs()
+        print(f"🔄 WinMM refresh: {count} MIDI input(s) detected")
+    except Exception as e:
+        print(f"⚠️ WinMM refresh failed: {e}")
+
+
+def base_name(n):
+    """Όνομα συσκευής χωρίς τον τελικό αριθμό-index που προσθέτει το RtMidi (π.χ. 'loopMIDI Port 1 4' -> 'loopmidi port 1')."""
+    return re.sub(r"\s+\d+$", "", (n or "").strip()).lower()
+
+
+# Μηνύματα καναλιού (εκτός από νότες) που αναμεταδίδονται: τύπος -> πεδία payload
+CHANNEL_MSG_FIELDS = {
+    "program_change": ("program",),
+    "control_change": ("control", "value"),
+    "pitchwheel": ("pitch",),
+    "aftertouch": ("value",),
+    "polytouch": ("note", "value"),
+}
+
+# --- Συγχρονισμός / buffer αναπαραγωγής ---------------------------------------------------
+BUFFER_MS = 40             # σταθερό buffer (ms) από τη στιγμή που πατήθηκε η νότα μέχρι να παιχτεί στον παραλήπτη
+BUFFER_MIN_MS = 0         # κάτω όριο του slider
+BUFFER_MAX_MS = 100         # άνω όριο του slider
+ADAPTIVE_BUFFER = True      # leaky max: το buffer ανεβαίνει όταν μια νότα έρθει αργά και χαλαρώνει σιγά-σιγά
+RELAX_MS_PER_S = 10         # πόσα ms/δευτερόλεπτο "χαλαρώνει" το επιπλέον buffer (πρέπει να είναι << 1000)
+MAX_EXTRA_MS = 100          # ανώτατο επιπλέον buffer πάνω από τη βάση
+SYNC_WINDOW = 8            # πόσα sync (×3 s) κοιτάμε για το δείγμα με το μικρότερο RTT
+
+PORT_PREFIX = "_MR_"                      # πρόθεμα των εσωτερικών virtual ports της εφαρμογής
+METRONOME_PORT_NAME = "_MR_METRONOME"     # όνομα του virtual port του metronome
+PORT_BASE_MAX = 25   # 31 (όριο WinMM) - len(" (DAW)")
+
+def display_name(real_name):
+    """Όνομα συσκευής όπως το βλέπει ο χρήστης στο GUI: χωρίς τον αύξοντα αριθμό που προσθέτει
+    το WinMM/RtMidi στο τέλος (π.χ. 'LoopPort1 2' -> 'LoopPort1'). Το πραγματικό όνομα χρειάζεται
+    μόνο για το άνοιγμα της συσκευής."""
+    return re.sub(r"\s+\d+$", "", (real_name or "").strip())
+
+
+# --- Loopback endpoints που δημιουργεί ο χρήστης (MIDI Port Manager) ---------------------------
+# Κάθε loopback είναι ζεύγος: "<όνομα> (A)" = εκεί στέλνει MIDI η εξωτερική εφαρμογή/DAW (output),
+# "<όνομα> (B)" = από εκεί διαβάζει το MIDIRooms (input). Ό,τι γράφεται στο (A) βγαίνει στο (B).
+LB_SEND_SUFFIX = " (A)"
+LB_RECV_SUFFIX = " (B)"
+LB_NAME_MAX = 31 - max(len(LB_SEND_SUFFIX), len(LB_RECV_SUFFIX))   # 27: το όνομα + κατάληξη χωράει στα 31 του WinMM
+USER_LOOPBACKS_FILE = "user_loopbacks.json"
+
+
+def loopback_role(real_name, loopbacks):
+    """('recv'|'send', όνομα_loopback) αν το port ανήκει σε loopback που δημιούργησε ο χρήστης, αλλιώς None."""
+    n = re.sub(r"\s+\d+$", "", (real_name or "").strip()).lower()
+    for lb in loopbacks:
+        l = lb.lower()
+        if n == l + LB_RECV_SUFFIX.lower():
+            return "recv", lb
+        if n == l + LB_SEND_SUFFIX.lower():
+            return "send", lb
+    return None
+
+
+def is_internal_port(name):
+    """True για τα virtual ports της ίδιας της εφαρμογής (_MR_0001, _MR_METRONOME, ...)."""
+    return display_name(name).upper().startswith(PORT_PREFIX)
+
+
+def device_choices(real_names):
+    """Λίστα (όνομα_προς_εμφάνιση, πραγματικό_όνομα). Αν δύο συσκευές έχουν ίδιο όνομα εμφάνισης,
+    μόνο στις επόμενες προστίθεται ' (2)', ' (3)' ώστε να ξεχωρίζουν."""
+    seen = {}
+    out = []
+    for real in real_names:
+        disp = display_name(real)
+        seen[disp] = seen.get(disp, 0) + 1
+        out.append((disp if seen[disp] == 1 else f"{disp} ({seen[disp]})", real))
+    return out
+
+
+PARK_INPUTS_ON_LEAVE = False   # False: κανονικό close() στο Leave (διαγνωστικό τεστ). True: parking αντί για close.
+VMIDI_POOL_SIZE = 0   # πόσα remote virtual ports (streams άλλων χρηστών) δημιουργούνται στην εκκίνηση.
+                      # Προσοχή: ΟΛΑ τα ports του teVirtualMIDI (και loopMIDI) είναι ένα endpoint των
+                      # Windows MIDI Services και το όριο είναι πιθανόν 16 συνολικά (UMP groups).
+                      # Για 2 instances στο ίδιο laptop βάλε 4.
+
+_zombie_ports = []   # ports που απέτυχαν να κλείσουν — τα κρατάμε ζωντανά
+
+
+def safe_close_port(port, label=""):
+    """
+    Στο παλιό RtMidi (WinMM), αν το close() αποτύχει (midiInUnprepareHeader), το αντικείμενο
+    μένει "connected" και ο destructor ξανατρέχει closePort() => διπλό delete => σιωπηλό crash.
+    Άρα αν αποτύχει, κρατάμε το αντικείμενο ζωντανό ώστε να μη γίνει ποτέ destruct.
+    """
+    for _k, _v in list(_open_inputs.items()):
+        if _v is port:
+            _open_inputs.pop(_k, None)
+    try:
+        port.close()
+        return True
+    except Exception as e:
+        print(f"⚠️ close input {label} failed: {e} — keeping port alive to avoid native crash")
+        _zombie_ports.append(port)
+        return False
+
+
+_open_inputs = {}   # real_name -> mido input port (μένουν ανοιχτά για όλη τη ζωή της εφαρμογής)
+
+
+def acquire_input(real_name):
+    """Επιστρέφει ανοιχτό input port. Αν η συσκευή έχει ήδη ανοιχτεί στο παρελθόν (π.χ. πριν το
+    προηγούμενο Leave), ξαναχρησιμοποιείται το ίδιο port αντί να ξανανοιχτεί."""
+    from mido import open_input
+    port = _open_inputs.get(real_name)
+    if port is not None:
+        try:
+            port.callback = None            # τέλος "parking": ξανά polling
+            for _ in port.iter_pending():   # πέτα ό,τι μαζεύτηκε όσο ήμασταν εκτός δωματίου
+                pass
+            print(f"♻️ Reusing already-open MIDI input {real_name}")
+            return port
+        except Exception as e:
+            print(f"⚠️ cached input {real_name} unusable ({e}) — reopening")
+            _open_inputs.pop(real_name, None)
+            _zombie_ports.append(port)
+    port = open_input(real_name)
+    _open_inputs[real_name] = port
+    return port
+
+
+def park_input(port):
+    """Αντί για close() στο Leave: το port μένει ανοιχτό, τα μηνύματά του απορρίπτονται."""
+    try:
+        port.callback = lambda msg: None
+    except Exception as e:
+        print(f"⚠️ park_input failed: {e}")
+
+
+def resolve_input(dev_name):
+    """Βρίσκει το ΤΡΕΧΟΝ πλήρες όνομα της συσκευής, ακόμα κι αν άλλαξε το index στο τέλος."""
+    try:
+        names = mido.get_input_names()
+    except Exception:
+        return None
+    if dev_name in names:
+        return dev_name
+    b = base_name(dev_name)
+    return next((n for n in names if base_name(n) == b), None)
+
+
+class VirtualMidiBridge:
+    def __init__(self, exe_path: str, extra_args=()):
+        self.p = subprocess.Popen(
+            [exe_path, *extra_args],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        self._q = queue.Queue()
+        self._t = threading.Thread(target=self._reader, daemon=True)
+        self._t.start()
+        self._lock = threading.Lock()
+
+        # consume initial READY from helper
+        try:
+            first = self._q.get(timeout=2)
+            print("BRIDGE INIT <-", first)
+        except Exception:
+            print("⚠️ No READY received from bridge")
+
+        # MIDI outputs opened by Python toward the virtual ports
+        self.output_cache = {}
+
+    def _reader(self):
+        for line in self.p.stdout:
+            line = line.rstrip("\n")
+            print(f"BRIDGE OUT: {line!r}")
+            self._q.put(line)
+
+    def _cmd(self, line: str, timeout: float = 2.0) -> str:
+        with self._lock:
+            # καθάρισε τυχόν καθυστερημένες/ορφανές απαντήσεις πριν στείλεις
+            while not self._q.empty():
+                try:
+                    self._q.get_nowait()
+                except queue.Empty:
+                    break
+            self.p.stdin.write(line + "\n")
+            self.p.stdin.flush()
+            try:
+                return self._q.get(timeout=timeout)
+            except queue.Empty:
+                return "ERR timeout"
+    def create(self, name: str, settle: float = 0.5) -> bool:
+        resp = self._cmd(f"CREATE|{name}",timeout=6.0)
+        print(f"CREATE '{name}' → reply: {resp!r}")
+        if not resp.startswith("OK"):
+            return False
+        time.sleep(settle)
+        return True
+
+    def create_pair(self, name: str, suffix_a: str, suffix_b: str, settle: float = 0.5) -> str:
+        """Ζεύγος με δικές μας καταλήξεις. Επιστρέφει την απάντηση του helper:
+        'OK sfx' = δημιουργήθηκε με τις καταλήξεις μας· 'OK' = παλιός helper (έφτιαξε (MR)/(DAW))."""
+        resp = self._cmd(f"CREATE|{name}|{suffix_a}|{suffix_b}", timeout=6.0)
+        print(f"CREATE '{name}' [{suffix_a}/{suffix_b}] → reply: {resp!r}")
+        if resp.startswith("OK"):
+            time.sleep(settle)
+        return resp
+
+    def close(self, name: str) -> bool:
+        # close Python-side mido output first
+        out = self.output_cache.pop(name, None)
+        if out:
+            try:
+                out.close()
+            except Exception:
+                pass
+
+        resp = self._cmd(f"CLOSE|{name}")
+        return resp.startswith("OK")
+
+    def send_hex(self, name: str, hex_bytes: str) -> bool:
+        """
+        Send MIDI through midiroomsports.exe.
+        This avoids mido.open_output(name), which may not see dynamic ports.
+        """
+        try:
+            resp = self._cmd(f"SEND|{name}|{hex_bytes}")
+            return resp.startswith("OK")
+        except Exception as e:
+            print(f"❌ Failed to send MIDI through bridge to {name}: {e}")
+            return False
+
+    def send_hex_nowait(self, name: str, hex_bytes: str):
+        """Στέλνει MIDI και ΔΙΑΒΑΖΕΙ το OK, ώστε να μη μένουν ορφανές απαντήσεις."""
+        self.send_hex(name, hex_bytes)
+
+    def shutdown(self):
+        for name in list(self.output_cache.keys()):
+            try:
+                self.output_cache[name].close()
+            except Exception:
+                pass
+        self.output_cache.clear()
+
+        try:
+            self._cmd("EXIT")
+        except Exception:
+            pass
+
+        try:
+            self.p.terminate()
+        except Exception:
+            pass
+class UsernameDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.ui = Ui_UsernameForm()
+        self.ui.setupUi(self)
+        # --- responsive layout με άνετα μεγέθη ---
+        self.ui.label.setAlignment(QtCore.Qt.AlignCenter)
+
+        # μεγαλύτερο ύψος στα widgets ώστε να μην "κόβονται"
+        self.ui.usernameLine.setMinimumHeight(32)
+        self.ui.continueButton.setMinimumHeight(34)
+        self.ui.continueButton.setMinimumWidth(100)
+
+        layout = QtWidgets.QVBoxLayout()
+        layout.setContentsMargins(30, 25, 30, 25)
+        layout.setSpacing(15)
+        layout.addWidget(self.ui.label)
+        layout.addWidget(self.ui.usernameLine)
+        layout.addWidget(self.ui.continueButton, alignment=QtCore.Qt.AlignCenter)
+
+        self.setLayout(layout)
+
+        # άνετο αρχικό μέγεθος ώστε όλα να φαίνονται σωστά
+        self.resize(340, 180)
+        self.setMinimumSize(300, 160)
+        self.username = None
+
+        self.ui.continueButton.clicked.connect(self.on_continue)
+        self.ui.usernameLine.returnPressed.connect(self.on_continue)
+
+    def on_continue(self):
+        text = self.ui.usernameLine.text().strip()
+
+        if not text:
+            QtWidgets.QMessageBox.warning(self, "Error", "Please enter a username.")
+            return
+
+        self.username = text
+        self.accept()
+class PianoWidget(QtWidgets.QWidget):
+    """
+    A two-octave piano: properly overlapped black keys above white keys.
+    - No labels on keys
+    - Only local key presses highlight (remote notes do NOT)
+    - Calls a provided send_midi(note, velocity) callback
+    """
+    WHITE_ORDER = [0, 2, 4, 5, 7, 9, 11]          # C D E F G A B
+    BLACK_MAP   = {0:1, 1:3, 3:6, 4:8, 5:10}      # which white-index has a black key after it (no sharps after E/B)
+
+    def __init__(self, parent=None, start_note=60, white_keys=21, on_send_midi=None):
+        super().__init__(parent)
+        self.start_note = start_note          # C4 by default
+        self.white_keys = white_keys          # 14 white keys = two octaves
+        self.on_send_midi = on_send_midi      # callback(room.send_midi)
+
+        # key geometry
+        self.WHITE_W, self.WHITE_H = 32, 150
+        self.BLACK_W, self.BLACK_H = 20, 95
+        self.setFixedSize(self.white_keys * self.WHITE_W, self.WHITE_H)
+
+        # containers
+        self.white_btns = {}   # note -> QPushButton
+        self.black_btns = {}   # note -> QPushButton
+        self._active = set()   # (channel, note) που κρατιούνται αυτή τη στιγμή (από MIDI συσκευές/αρχεία)
+
+        # No layout: absolute positioning to overlap blacks over whites
+        # ---- place white keys ----
+        for i in range(self.white_keys):
+            octave   = i // 7
+            w_index  = i % 7
+            midi     = self.start_note + self.WHITE_ORDER[w_index] + 12 * octave
+
+            btn = QtWidgets.QPushButton("", self)
+            btn.setGeometry(i * self.WHITE_W, 0, self.WHITE_W, self.WHITE_H)
+            btn.setFocusPolicy(QtCore.Qt.NoFocus)
+            btn.setStyleSheet("background:#fff; border:1px solid #000;")
+            btn.pressed.connect(lambda n=midi: self._local_press(n))
+            btn.released.connect(lambda n=midi: self._local_release(n))
+            self.white_btns[midi] = btn
+
+        # ---- place black keys (between whites, except after E/B) ----
+        for i in range(self.white_keys):
+            w_index = i % 7
+            if w_index in self.BLACK_MAP:
+                octave = i // 7
+                midi   = self.start_note + self.BLACK_MAP[w_index] + 12 * octave
+
+                # center black over gap between white i and i+1
+                x = i * self.WHITE_W + (self.WHITE_W - self.BLACK_W // 2)
+                btn = QtWidgets.QPushButton("", self)
+                btn.setGeometry(x, 0, self.BLACK_W, self.BLACK_H)
+                btn.raise_()
+                btn.setFocusPolicy(QtCore.Qt.NoFocus)
+                btn.setStyleSheet("background:#000; border:1px solid #333;")
+                btn.pressed.connect(lambda n=midi: self._local_press(n))
+                btn.released.connect(lambda n=midi: self._local_release(n))
+                self.black_btns[midi] = btn
+
+    # ---- local press/release: send MIDI + highlight locally only ----
+    def _local_press(self, note):
+        if callable(self.on_send_midi):
+            self.on_send_midi(note, 100)
+        self._highlight(note, True)
+
+    def _local_release(self, note):
+        if callable(self.on_send_midi):
+            self.on_send_midi(note, 0)
+        self._highlight(note, False)
+
+    def note_event(self, channel, note, on):
+        """Ανάβει/σβήνει ένα πλήκτρο με βάση τα ΕΝΕΡΓΑ (κανάλι, νότα): το πλήκτρο μένει αναμμένο
+        όσο κρατιέται σε οποιοδήποτε κανάλι και σβήνει όταν δεν κρατιέται πουθενά."""
+        if note is None:
+            return
+        if on:
+            self._active.add((channel, note))
+        else:
+            self._active.discard((channel, note))
+        self._highlight(note, any(n == note for (_, n) in self._active))
+
+    def clear_channel(self, channel):
+        """All Notes Off / All Sound Off ενός καναλιού (CC 123 / 120)."""
+        for (ch, n) in [x for x in self._active if x[0] == channel]:
+            self._active.discard((ch, n))
+            self._highlight(n, any(nn == n for (_, nn) in self._active))
+
+    def clear_all(self):
+        """Σβήνει όλα τα πλήκτρα (Leave, Mute, κλείσιμο)."""
+        notes = {n for (_, n) in self._active}
+        self._active.clear()
+        for n in notes:
+            self._highlight(n, False)
+
+    def _highlight(self, note, on):
+        # set color back based on key type
+        if note in self.white_btns:
+            btn = self.white_btns[note]
+            if on:
+                btn.setStyleSheet("background: #ffea75; border:2px solid #d9a400;")  # yellow
+            else:
+                btn.setStyleSheet("background:#fff; border:1px solid #000;")
+        elif note in self.black_btns:
+            btn = self.black_btns[note]
+            if on:
+                btn.setStyleSheet("background: #555; border:2px solid #333;")        # lighter when pressed
+            else:
+                btn.setStyleSheet("background:#000; border:1px solid #333;")
+
+# ==================================================================================================
+# Αξιόπιστη μεταφορά πάνω από ΜΗ αξιόπιστο DataChannel (χωρίς απώλεια νοτών, χωρίς το RTO 1 s του SCTP)
+# ==================================================================================================
+class RedundantLink:
+    """
+    Αξιόπιστη μεταφορά MIDI events πάνω από ΜΗ αξιόπιστο DataChannel (ordered=False, maxRetransmits=0).
+    Στόχος: καμία νότα να μη χάνεται, χωρίς το ελάχιστο RTO ~1 s του SCTP (το οποίο θα καθυστερούσε
+    ένα χαμένο note-off κατά ~1 s).
+
+      * Κάθε event παίρνει αύξοντα αριθμό (seq του link).
+      * Κάθε datagram φέρνει το νέο event ΚΑΙ τα τελευταία ακόμα-μη-επιβεβαιωμένα (redundancy):
+        ένα χαμένο πακέτο ανακτάται από το επόμενο, χωρίς να περιμένει timer.
+      * Ο παραλήπτης αποστέλλει ack (cumulative + selective) μέσα σε λίγα ms· ένα κενό στους αριθμούς
+        προκαλεί ΑΜΕΣΗ ανακοίνωση (fast retransmit).
+      * Timer (RTO προσαρμοσμένο στο μετρημένο RTT) ξαναστέλνει ό,τι δεν επιβεβαιώθηκε (χαμένο τελευταίο event).
+      * Ο παραλήπτης αγνοεί διπλότυπα. Η σειρά δεν επιβάλλεται εδώ: η εφαρμογή παίζει κάθε νότα
+        με βάση το timestamp του αποστολέα (play_time), άρα αργοπορημένη άφιξη χάνει μόνο ακρίβεια, όχι νότα.
+      * Αν δεν έρθει ack για MAX_AGE δευτερόλεπτα, το link θεωρείται χαλασμένο (broken) και τα
+        απλήρωτα events παραδίδονται στο on_broken για επανάληψη από άλλη διαδρομή (server).
+    """
+    PIGGY = 16            # πόσα απλήρωτα events συνοδεύουν κάθε νέο event
+    RETX_MAX = 32         # μέγιστα events ανά retransmit
+    TICK = 0.005
+    MAX_AGE = 1.5
+    ACK_DELAY = 0.003
+
+    def __init__(self, send_raw, deliver, on_broken=None, clock=time.perf_counter,
+                 max_age=None, hedge_s=None, on_hedge=None):
+        self.send_raw = send_raw          # f(str)
+        self.deliver = deliver            # f(dict) -> None, καλείται μία φορά ανά event
+        self.on_broken = on_broken        # f(list[dict]) -> None
+        self.max_age = self.MAX_AGE if max_age is None else max_age
+        self.hedge_s = hedge_s            # event χωρίς ack για hedge_s => on_hedge([events]) (αντίγραφο από άλλη διαδρομή)
+        self.on_hedge = on_hedge
+        self.last_rx = None               # πότε ήρθε τελευταία φορά ΟΤΙΔΗΠΟΤΕ από τον άλλο
+        self.last_ack = None              # πότε επιβεβαιώθηκε τελευταία φορά event
+        self.break_info = None
+        self.now = clock
+        self.broken = False
+        self.closed = False
+        self.next_seq = 1
+        self.unacked = OrderedDict()      # seq -> [ev, t_first, t_last, nsent]
+        self.rx_cum = 0
+        self.rx_extra = set()
+        self.srtt = None
+        self._ack_due = None
+        self._task = None
+        # στατιστικά
+        self.stats = {"sent": 0, "retx": 0, "dups": 0, "delivered": 0, "acks_tx": 0, "hedged": 0}
+
+    # ---------- αποστολή ----------
+    def send(self, ev):
+        if self.closed or self.broken:
+            return False
+        seq = self.next_seq
+        self.next_seq += 1
+        t = self.now()
+        self.unacked[seq] = [ev, t, t, 1, False]   # event, 1η αποστολή, τελευταία αποστολή, #αποστολές, hedged
+        self.stats["sent"] += 1
+        items = list(self.unacked.items())[-self.PIGGY:]
+        self._tx_data([(s, v[0]) for s, v in items])
+        return True
+
+    def _tx_data(self, pairs):
+        pkt = {"k": "d", "a": self.rx_cum, "e": [[s, e] for s, e in pairs]}
+        if self.rx_extra:
+            pkt["x"] = sorted(self.rx_extra)[:32]
+        self._ack_due = None                  # το ack πηγαίνει μαζί
+        try:
+            self.send_raw(json.dumps(pkt, separators=(",", ":")))
+        except Exception:
+            pass
+
+    def _tx_ack(self):
+        pkt = {"k": "a", "a": self.rx_cum}
+        if self.rx_extra:
+            pkt["x"] = sorted(self.rx_extra)[:32]
+        self._ack_due = None
+        self.stats["acks_tx"] += 1
+        try:
+            self.send_raw(json.dumps(pkt, separators=(",", ":")))
+        except Exception:
+            pass
+
+    def rto(self):
+        if self.srtt is None:
+            return 0.08
+        return min(0.25, max(0.03, self.srtt * 1.25 + 0.01))
+
+    # ---------- λήψη ----------
+    def on_raw(self, raw):
+        try:
+            pkt = json.loads(raw)
+        except Exception:
+            return
+        now = self.now()
+        self.last_rx = now
+        # 1) ack πληροφορία (cumulative + selective)
+        a = pkt.get("a", 0)
+        if a:
+            for s in [s for s in self.unacked if s <= a]:
+                self._acked(s, now)
+        xs = pkt.get("x") or []
+        for s in xs:
+            if s in self.unacked:
+                self._acked(s, now)
+        # fast retransmit: κάτι έφτασε πάνω από ένα απλήρωτο seq => το απλήρωτο χάθηκε
+        if xs and self.unacked:
+            hi = max(xs)
+            lost = [s for s in self.unacked if s < hi]
+            self._retransmit(lost, now, min_age=0.002)
+
+        # 2) δεδομένα
+        evs = pkt.get("e")
+        if evs:
+            new = False
+            for s, ev in evs:
+                if s <= self.rx_cum or s in self.rx_extra:
+                    self.stats["dups"] += 1
+                    continue
+                new = True
+                self.rx_extra.add(s)
+                self.stats["delivered"] += 1
+                try:
+                    self.deliver(ev)
+                except Exception as e:
+                    print("⚠️ P2P deliver error:", e)
+            while (self.rx_cum + 1) in self.rx_extra:
+                self.rx_cum += 1
+                self.rx_extra.discard(self.rx_cum)
+            if new:
+                if self.rx_extra:
+                    self._tx_ack()            # κενό: άμεση ανακοίνωση (λειτουργεί σαν NACK)
+                elif self._ack_due is None:
+                    self._ack_due = now + self.ACK_DELAY
+            elif self._ack_due is None:
+                self._ack_due = now + self.ACK_DELAY   # διπλότυπο: ο αποστολέας μάλλον δεν πήρε το ack μας
+
+    def _acked(self, s, now):
+        ent = self.unacked.pop(s, None)
+        if ent:
+            self.last_ack = now
+        if ent and ent[3] == 1:            # Karn: μόνο για events που δεν ξαναστάλθηκαν
+            rtt = now - ent[1]
+            self.srtt = rtt if self.srtt is None else 0.875 * self.srtt + 0.125 * rtt
+
+    def _retransmit(self, seqs, now, min_age):
+        pairs = []
+        for s in seqs[: self.RETX_MAX]:
+            ent = self.unacked.get(s)
+            if ent is None or now - ent[2] < min_age:
+                continue
+            ent[2] = now
+            ent[3] += 1
+            pairs.append((s, ent[0]))
+        if pairs:
+            self.stats["retx"] += len(pairs)
+            self._tx_data(pairs)
+
+    # ---------- timer ----------
+    def tick(self):
+        now = self.now()
+        if self._ack_due is not None and now >= self._ack_due:
+            self._tx_ack()
+        if self.unacked:
+            first = next(iter(self.unacked.values()))
+            if now - first[1] > self.max_age:
+                self._break(now)
+                return
+            if self.on_hedge is not None and self.hedge_s is not None:
+                hedge = []
+                for v in self.unacked.values():
+                    if not v[4] and now - v[1] >= self.hedge_s:
+                        v[4] = True
+                        hedge.append(v[0])
+                if hedge:
+                    self.stats["hedged"] += len(hedge)
+                    try:
+                        self.on_hedge(hedge)
+                    except Exception as e:
+                        print("⚠️ P2P on_hedge error:", e)
+            rto = self.rto()
+            due = [s for s, v in self.unacked.items() if now - v[2] >= rto]
+            if due:
+                self._retransmit(due, now, min_age=0.0)
+
+    def snapshot(self):
+        """Στιγμιότυπο για διαγνωστικά: απλήρωτα, ηλικία παλαιότερου, srtt, πόση ώρα έχει να έρθει κάτι."""
+        now = self.now()
+        oldest = (now - next(iter(self.unacked.values()))[1]) * 1000.0 if self.unacked else 0.0
+        return {"unacked": len(self.unacked), "oldest_ms": oldest,
+                "srtt_ms": None if self.srtt is None else self.srtt * 1000.0,
+                "since_rx_ms": None if self.last_rx is None else (now - self.last_rx) * 1000.0,
+                "since_ack_ms": None if self.last_ack is None else (now - self.last_ack) * 1000.0,
+                **self.stats}
+
+    def pending_events(self):
+        return [v[0] for v in self.unacked.values()]
+
+    def _break(self, now=None):
+        now = self.now() if now is None else now
+        self.break_info = self.snapshot()
+        self.broken = True
+        pending = [v[0] for v in self.unacked.values()]
+        self.unacked.clear()
+        if self.on_broken:
+            try:
+                self.on_broken(pending)
+            except Exception as e:
+                print("⚠️ P2P on_broken error:", e)
+
+    async def run(self):
+        try:
+            while not self.closed and not self.broken:
+                self.tick()
+                await asyncio.sleep(self.TICK)
+        except asyncio.CancelledError:
+            pass
+
+    def start(self):
+        self._task = asyncio.ensure_future(self.run())
+
+    def close(self):
+        self.closed = True
+        if self._task:
+            self._task.cancel()
+
+
+class RoomWindow(QWidget):
+    def __init__(self, main_app, room_name="lobby", is_creator=False):
+        super().__init__()
+        self.local_mute = False
+        self._left = False              # γίνεται True μετά το leave_room
+        self._vmidi_fail_ts = {}        # port_name -> τελευταία αποτυχία create
+        self.main_app = main_app
+        self.room_name = room_name
+        self.metronome_running = False
+        self.metronome_bpm = 120
+        self.metronome_start_time = None
+        self.metronome_last_beat = -1
+        self.is_creator = is_creator
+        self.ui = Ui_roomwindow()
+        self.ui.setupUi(self)
+        # ξεκλείδωμα μεγέθους — επιτρέπει resize και maximize
+        self.setMinimumSize(800, 600)
+        self.setMaximumSize(16777215, 16777215)
+        # άφησε το piano scroll area να επεκτείνεται οριζόντια
+        self.ui.pianoScrollArea.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Fixed
+        )
+        self.ui.pianoScrollArea.setMaximumSize(16777215, 300)
+
+        # το log area να παίρνει τον περισσότερο κάθετο χώρο
+        self.ui.logArea.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Expanding
+        )
+        self.ui.bpmSpinBox.setSuffix(" BPM")
+        self.ui.StartButton.clicked.connect(self.start_recording)
+        self.ui.StopButton.clicked.connect(self.stop_recording)
+        self.ui.StopButton.setEnabled(False)
+        self.ui.startMetronomeButton.clicked.connect(self.start_metronome_clicked)
+        self.ui.stopMetronomeButton.clicked.connect(self.stop_metronome_clicked)
+        self.ui.applyBpmButton.clicked.connect(self.apply_bpm_clicked)
+        self.ui.bpmSpinBox.setValue(self.metronome_bpm)
+        self.piano = PianoWidget(
+            self,
+            start_note=24,  # C1
+            white_keys=49  # 88-key piano
+        )
+        # Το metronome port δημιουργείται ΜΙΑ φορά στην εκκίνηση (init_vmidi_pool), όχι εδώ:
+        # ports που δημιουργούνται ενώ υπάρχει ανοιχτή σύνδεση στο teVirtualMIDI endpoint
+        # δεν είναι ορατά (δες πείραμα R2/R3).
+        self.metronome_port_name = getattr(self.main_app, "metronome_port_name", None)
+        self.metronome_timer = QtCore.QTimer()
+        self.metronome_timer.timeout.connect(self.metronome_tick)
+        self.metronome_timer.start(10)
+        self.recording = False
+        self.recorded_events = []
+        self.recording_start_time = None
+        self.ui.pianoScrollArea.setWidgetResizable(False)
+        self.ui.pianoScrollArea.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOn)
+        self.ui.pianoScrollArea.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.ui.pianoScrollArea.setWidget(self.piano)
+        self.setWindowTitle(f"MIDIROOMS - {room_name}")
+        self.ui.LeaveButton.clicked.connect(self.leave_room)
+        self.ui.logArea.clear()
+        self.log_manager = LogManager(self)
+        self._auto_start_room_log()
+        self.user_ui_elements = {}
+        self.user_name_labels = {}      # username -> QLabel (για την ένδειξη "(leader)")
+        self.user_ips = {}              # username -> IP όπως τη βλέπει ο server
+        self._logged_ips = set()        # χρήστες των οποίων η IP έχει ήδη γραφτεί στο log
+        self._make_users_layout_horizontal()
+        self.user_velocity_bars = {}
+        self.user_latency_labels = {}
+        self.velocity_reset_timers = {}  # username -> QTimer
+        self.piano_off_timers = {}  # note -> QTimer (optional, prevents singleShot spam)
+        self.connected_users = []
+        self.midi_seq = 0
+        self.p2p_peers = {}                 # χρήστης -> P2PPeer
+        self.p2p_sid = uuid.uuid4().hex[:8] # αναγνωριστικό της συνεδρίας μου (ώστε τα seq να μην συγκρούονται μετά από rejoin)
+        self._dedup = set()
+        self._dedup_q = deque()
+        self.last_seq_from_peer = {}
+        self.add_user_ui(self.main_app.username)  # show myself
+        self.ui.muteButton.clicked.connect(self.toggle_local_mute)
+        self.ui.routingmanagerButton.clicked.connect(self.open_routing_manager)
+        # κουμπί για Log Settings
+        self.logSettingsButton = QtWidgets.QPushButton("Log Settings", self)
+        self.ui.horizontalLayout.addWidget(self.logSettingsButton)
+        self.logSettingsButton.clicked.connect(self.open_log_settings)
+        self._init_buffer_controls()
+        # WebRTC objects
+        self.offer_sent = False
+        self.pc = None
+        self.channel = None
+        # Use preselected ports from settings
+        # Use preselected ports from settings
+        self.midi_inputs = []  # list of (stream_id, mido_input_port)
+        self.stream_devices = {}  # stream_id -> device name
+        self.clock_offset_from_peer = {}
+        self.remote_midi_queue = []
+        self.remote_playback_delay = 0.005  # 5 ms
+        self.peer_jitter = {}
+        self.rtt_samples = {}
+        self.remote_playback_timer = QtCore.QTimer()
+        self.remote_playback_timer.timeout.connect(self.process_remote_midi_queue)
+        self.remote_playback_timer.start(2)
+        self.server_clock_offset = 0.0  # διαφορά τοπικού ρολογιού από τον server
+        self.server_rtt_samples = []  # για jitter measurement
+
+        from mido import open_input, open_output
+
+        # Get selected inputs (new) or fallback to old single input
+        selected_inputs = getattr(self.main_app, "selected_inputs", None)
+        if not selected_inputs:
+            one = getattr(self.main_app, "selected_input", None)
+            selected_inputs = [one] if one else []
+
+        self.failed_inputs = set()
+        # (αφαιρέθηκε το blocking time.sleep(3.0) — το init_midi_inputs ήδη τρέχει 3.5s αργότερα)
+        if getattr(self.main_app, "midi_service_was_refreshed", False):
+            self.main_app.midi_service_was_refreshed = False
+
+        # Poll MIDI input
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self.poll_midi_input)
+        self.timer.start(1)
+        self.ping_timer = QtCore.QTimer()
+        self.ping_timer.timeout.connect(lambda: asyncio.ensure_future(self.send_ping()))
+        self.ping_timer.start(3000)  # every 3 seconds
+        self.hotplug_timer = QtCore.QTimer()
+        self.hotplug_timer.timeout.connect(self.scan_new_midi_inputs)
+        self.hotplug_timer.start(3000)  # every 3 seconds
+
+        # περιοδικό re-announce streams — ώστε αν χαθεί το πρώτο να ξαναστείλουμε
+        self.announce_timer = QtCore.QTimer()
+        self.announce_timer.timeout.connect(self.send_streams_announce)
+        self.announce_timer.start(10000)  # κάθε 10 δευτερόλεπτα
+
+        QtCore.QTimer.singleShot(3500, self.init_midi_inputs)
+
+    def init_midi_inputs(self):
+        import mido
+
+        print("🚀 Initializing MIDI inputs AFTER delay...")
+
+        if self._left:
+            return
+
+        # (δεν μηδενίζουμε τις λίστες εδώ: το hotplug μπορεί ήδη να άνοιξε τη συσκευή στα 3s,
+        #  και το try_reopen_device ελέγχει ήδη αν είναι ανοιχτή)
+        selected_inputs = list(getattr(self.main_app, "selected_inputs", []) or [])
+
+        try:
+            print("🎹 Available inputs after delay:", mido.get_input_names())
+        except Exception as e:
+            print("⚠️ get_input_names failed:", e)
+
+        # try_reopen_device είναι NON-BLOCKING (QTimer retries) και ανοίγει
+        # τη συσκευή με σταθερή αντιστοίχιση ονόματος (resolve_input).
+        for dev_name in selected_inputs:
+            self.try_reopen_device(dev_name)
+
+    # ============================ P2P (WebRTC DataChannel) ============================
+    def p2p_active(self):
+        return bool(P2P_ENABLED and P2P_AVAILABLE) and not self._left
+
+    def _p2p_new_peer(self, user):
+        peer = types.SimpleNamespace(user=user, pc=None, channel=None, link=None, state="new",
+                                     t0=time.perf_counter(), attempt=0, initiator=False,
+                                     reconn=None, reconn_n=0, stats=None)
+        self.p2p_peers[user] = peer
+        return peer
+
+    def p2p_sync_peers(self, users):
+        """Καλείται όταν αλλάζει η λίστα χρηστών: ξεκινά P2P με τους νέους, κλείνει με όσους έφυγαν."""
+        if not self.p2p_active():
+            return
+        me = self.main_app.username
+        others = {u for u in users if u and u != me}
+        for u in list(self.p2p_peers):
+            if u not in others:
+                self.p2p_close_peer(u, "left the room")
+        for u in sorted(others):
+            if u not in self.p2p_peers:
+                peer = self._p2p_new_peer(u)
+                if me < u:                       # ντετερμινιστικά: μόνο ο ένας από τους δύο στέλνει offer
+                    peer.initiator = True
+                    asyncio.ensure_future(self._p2p_start_offer(peer))
+
+    def _p2p_make_pc(self, peer):
+        self._p2p_drop_pc(peer)
+        pc = RTCPeerConnection(_p2p_ice_config())
+        peer.pc = pc
+
+        @pc.on("connectionstatechange")
+        async def _on_state():
+            st = pc.connectionState
+            if peer.pc is pc and st in ("failed", "closed") and peer.state != "closed":
+                self._p2p_fail(peer, f"connection {st}")
+
+        @pc.on("datachannel")
+        def _on_dc(channel):
+            self._p2p_attach_channel(peer, channel)
+        return pc
+
+    def _p2p_drop_pc(self, peer, flush=True):
+        if peer.link:
+            pend = [] if (peer.link.broken or not flush) else peer.link.pending_events()
+            peer.link.close()
+            peer.link = None
+            if pend and self.main_app.ws:        # ό,τι δεν επιβεβαιώθηκε ακόμα πάει μέσω server (ο παραλήπτης αγνοεί διπλότυπα)
+                for ev in pend:
+                    asyncio.ensure_future(self.main_app.ws.send(json.dumps({**ev, "to": peer.user})))
+        try:
+            if peer.channel:
+                peer.channel.close()
+        except Exception:
+            pass
+        peer.channel = None
+        if peer.pc is not None:
+            old = peer.pc
+            peer.pc = None
+            asyncio.ensure_future(old.close())
+
+    def _p2p_attach_channel(self, peer, channel):
+        peer.channel = channel
+
+        @channel.on("open")
+        def _on_open():
+            self._p2p_up(peer)
+
+        @channel.on("message")
+        def _on_message(m):
+            if peer.link is not None:
+                peer.link.on_raw(m if isinstance(m, str) else m.decode("utf-8", "ignore"))
+
+        if getattr(channel, "readyState", None) == "open":
+            self._p2p_up(peer)
+
+    def _p2p_up(self, peer):
+        if peer.link is not None or peer.channel is None or self._left:
+            return
+        ch = peer.channel
+
+        def send_raw(text):
+            if getattr(ch, "readyState", None) == "open":
+                ch.send(text)
+
+        peer.link = RedundantLink(
+            send_raw,
+            deliver=lambda ev: self._p2p_deliver(peer, ev),
+            on_broken=lambda pending: self._p2p_broken(peer, pending),
+            max_age=P2P_MAX_ACK_AGE_S, hedge_s=P2P_HEDGE_S,
+            on_hedge=lambda evs: self._p2p_hedge(peer, evs))
+        peer.link.start()
+        peer.state = "up"
+        peer.reconn_n = 0
+        ms = (time.perf_counter() - peer.t0) * 1000
+        self.log_manager.log("SYSTEM", f"🔗 P2P link up with {peer.user} ({ms:.0f} ms to connect) — MIDI goes directly")
+        try:
+            pc = peer.pc
+            loc = _p2p_sdp_candidates(pc.localDescription.sdp if pc and pc.localDescription else "")
+            rem = _p2p_sdp_candidates(pc.remoteDescription.sdp if pc and pc.remoteDescription else "")
+            sel = _p2p_selected_pair(pc) if pc else None
+            self.log_manager.log("SYSTEM", f"🧭 P2P path with {peer.user}: selected = {sel or 'unknown'}")
+            self.log_manager.log("SYSTEM", f"🧭 local candidates: {'; '.join(loc[:8]) or '-'}")
+            self.log_manager.log("SYSTEM", f"🧭 remote candidates: {'; '.join(rem[:8]) or '-'}")
+        except Exception as e:
+            self.log_manager.log("SYSTEM", f"🧭 P2P path info unavailable: {e}")
+        if peer.stats is not None:
+            peer.stats.cancel()
+        peer.stats = asyncio.ensure_future(self._p2p_stats_loop(peer, peer.link))
+
+    def _p2p_hedge(self, peer, events):
+        """Event χωρίς ack για P2P_HEDGE_S: στέλνεται ΚΑΙ μέσω server (dedup στον παραλήπτη)."""
+        ws = self.main_app.ws
+        if ws:
+            for ev in events:
+                asyncio.ensure_future(ws.send(json.dumps({**ev, "to": peer.user})))
+
+    async def _p2p_stats_loop(self, peer, link):
+        """Διαγνωστικά: στατιστικά του link στο log, και άμεσα όταν ένα event μένει χωρίς ack."""
+        prev = link.snapshot()
+        t_log = time.perf_counter()
+        t_stall = t_log - 1.0                 # ώστε το πρώτο STALL να γραφτεί αμέσως
+        try:
+            while peer.link is link and not link.closed and not link.broken:
+                await asyncio.sleep(0.1)
+                now = time.perf_counter()
+                snap = link.snapshot()
+                stalled = snap["oldest_ms"] >= P2P_STALL_LOG_S * 1000
+                periodic = now - t_log >= P2P_STATS_EVERY_S
+                if not ((periodic and (snap["sent"] != prev["sent"] or snap["delivered"] != prev["delivered"]))
+                        or (stalled and now - t_stall >= 0.5)):
+                    if periodic:
+                        t_log, prev = now, snap
+                    continue
+                d = lambda k: snap[k] - prev[k]
+                fmt = lambda v: "-" if v is None else f"{v:.0f}"
+                pc = peer.pc
+                buf = getattr(peer.channel, "bufferedAmount", None)
+                extra = (_p2p_sctp_info(pc) if pc else "") + (f" buf={buf}" if buf is not None else "")
+                self.log_manager.log(
+                    "SYSTEM",
+                    f"📊 P2P {peer.user}{' STALL' if stalled else ''}: sent+{d('sent')} retx+{d('retx')} "
+                    f"hedged+{d('hedged')} rx+{d('delivered')} dup+{d('dups')} | unacked {snap['unacked']} "
+                    f"oldest {snap['oldest_ms']:.0f} ms | srtt {fmt(snap['srtt_ms'])} ms | "
+                    f"nothing received for {fmt(snap['since_rx_ms'])} ms, last ack {fmt(snap['since_ack_ms'])} ms ago"
+                    f"{(' | ' + extra.strip()) if extra.strip() else ''}")
+                if stalled:
+                    t_stall = now
+                else:
+                    t_log, prev = now, snap
+        except asyncio.CancelledError:
+            pass
+
+    def _p2p_deliver(self, peer, ev):
+        ev["_via"] = "p2p"
+        self.on_midi_message(json.dumps(ev))
+
+    def _p2p_broken(self, peer, pending):
+        """Το link δεν παίρνει ack: τα απλήρωτα events ξαναστέλνονται μέσω server και το ζευγάρι πάει σε relay."""
+        peer.state = "failed"
+        info = peer.link.break_info if peer.link is not None and peer.link.break_info else {}
+        fmt = lambda v: "-" if v is None else f"{v:.0f}"
+        self.log_manager.log("SYSTEM", f"⚠️ P2P link with {peer.user} stopped answering — using the server relay "
+                                       f"({len(pending)} pending events resent)")
+        self.log_manager.log("SYSTEM", f"🔍 P2P break reason: oldest event {fmt(info.get('oldest_ms'))} ms without ack "
+                                       f"(limit {P2P_MAX_ACK_AGE_S * 1000:.0f} ms), nothing received for "
+                                       f"{fmt(info.get('since_rx_ms'))} ms, last ack {fmt(info.get('since_ack_ms'))} ms ago, "
+                                       f"retx {info.get('retx', '-')}, hedged {info.get('hedged', '-')}, "
+                                       f"{_p2p_sctp_info(peer.pc) if peer.pc else ''}")
+        ws = self.main_app.ws
+        if ws:
+            for ev in pending:
+                asyncio.ensure_future(ws.send(json.dumps({**ev, "to": peer.user})))
+        self._p2p_schedule_reconnect(peer)
+
+    def _p2p_fail(self, peer, reason):
+        if peer.state in ("failed", "closed"):
+            return
+        if peer.state == "up" and peer.link is not None and not peer.link.broken:
+            peer.link.close()
+        peer.state = "failed"
+        self.log_manager.log("SYSTEM", f"↪️ P2P with {peer.user} not available ({reason}) — using the server relay")
+        self._p2p_drop_pc(peer)
+        self._p2p_schedule_reconnect(peer)
+
+    def p2p_close_peer(self, user, reason=""):
+        peer = self.p2p_peers.pop(user, None)
+        if not peer:
+            return
+        peer.state = "closed"
+        for t in (peer.reconn, peer.stats):
+            if t is not None:
+                t.cancel()
+        self._p2p_drop_pc(peer, flush=False)
+        if reason:
+            self.log_manager.log("SYSTEM", f"🔌 P2P with {user} closed ({reason})")
+
+    def p2p_close_all(self):
+        for u in list(self.p2p_peers):
+            self.p2p_close_peer(u)
+
+    def _p2p_schedule_reconnect(self, peer):
+        if not self.p2p_active() or peer.state == "closed":
+            return
+        if peer.reconn is not None and not peer.reconn.done():
+            return
+        peer.reconn = asyncio.ensure_future(self._p2p_reconnect_loop(peer))
+
+    async def _p2p_reconnect_loop(self, peer):
+        """Μετά από πτώση (ή αποτυχία σύνδεσης): νέο offer με αυξανόμενη αναμονή. Όσο δεν ανεβαίνει, ισχύει ο server."""
+        try:
+            while (peer.reconn_n < P2P_RECONNECT_MAX and self.p2p_active()
+                   and self.p2p_peers.get(peer.user) is peer and peer.state != "closed"):
+                delay = P2P_RECONNECT_DELAYS_S[min(peer.reconn_n, len(P2P_RECONNECT_DELAYS_S) - 1)]
+                peer.reconn_n += 1
+                await asyncio.sleep(delay)
+                if peer.state in ("up", "closed") or not self.p2p_active():
+                    return
+                if peer.state == "connecting":      # ο άλλος μας έστειλε offer στο μεταξύ
+                    await asyncio.sleep(P2P_CONNECT_TIMEOUT_S + 1)
+                    if peer.state == "up":
+                        return
+                    continue
+                self.log_manager.log("SYSTEM", f"🔁 P2P with {peer.user}: reconnect attempt {peer.reconn_n}/{P2P_RECONNECT_MAX}")
+                peer.state = "new"
+                peer.attempt = 0
+                peer.t0 = time.perf_counter()
+                await self._p2p_start_offer(peer)
+                await asyncio.sleep(P2P_CONNECT_TIMEOUT_S + 1)
+                if peer.state == "up":
+                    return
+            if peer.state not in ("up", "closed"):
+                self.log_manager.log("SYSTEM", f"⏹️ P2P with {peer.user}: giving up reconnecting — the server relay stays in use")
+        except asyncio.CancelledError:
+            pass
+
+    async def _p2p_watchdog(self, peer):
+        try:
+            await asyncio.sleep(P2P_RETRY_AT_S)
+            if peer.state == "connecting" and peer.initiator and peer.attempt < 2 and self.p2p_active():
+                self.log_manager.log("SYSTEM", f"🔁 P2P with {peer.user}: no answer, sending the offer again")
+                await self._p2p_start_offer(peer, watchdog=False)
+            await asyncio.sleep(max(0.0, P2P_CONNECT_TIMEOUT_S - P2P_RETRY_AT_S))
+            if peer.state == "connecting":
+                self._p2p_fail(peer, "could not connect directly (NAT/firewall)")
+        except asyncio.CancelledError:
+            pass
+
+    async def _p2p_start_offer(self, peer, watchdog=True):
+        if not self.p2p_active() or peer.state not in ("new", "connecting") or not self.main_app.ws:
+            return
+        try:
+            peer.state = "connecting"
+            peer.attempt += 1
+            pc = self._p2p_make_pc(peer)
+            ch = pc.createDataChannel("midi", ordered=False, maxRetransmits=0)
+            self._p2p_attach_channel(peer, ch)
+            await pc.setLocalDescription(await pc.createOffer())
+            await self.main_app.ws.send(json.dumps({
+                "type": "offer", "room": self.room_name,
+                "from": self.main_app.username, "to": peer.user,
+                "sdp": pc.localDescription.sdp, "sdpType": pc.localDescription.type}))
+            if watchdog:
+                asyncio.ensure_future(self._p2p_watchdog(peer))
+        except Exception as e:
+            self._p2p_fail(peer, f"offer failed: {e}")
+
+    async def p2p_on_signal(self, data):
+        """offer / answer από κάποιον άλλον (μέσω server)."""
+        if not self.p2p_active() or data.get("to") != self.main_app.username:
+            return
+        frm = data.get("from")
+        if not frm or frm == self.main_app.username:
+            return
+        peer = self.p2p_peers.get(frm) or self._p2p_new_peer(frm)
+        try:
+            if data["type"] == "offer":
+                pc0 = peer.pc
+                if (pc0 is not None and pc0.signalingState == "have-local-offer"
+                        and self.main_app.username < frm):
+                    return                          # και οι δύο στείλαμε offer ταυτόχρονα: κερδίζει το μικρότερο όνομα
+                peer.state = "connecting"
+                pc = self._p2p_make_pc(peer)
+                await pc.setRemoteDescription(RTCSessionDescription(sdp=data["sdp"], type=data.get("sdpType", "offer")))
+                await pc.setLocalDescription(await pc.createAnswer())
+                await self.main_app.ws.send(json.dumps({
+                    "type": "answer", "room": self.room_name,
+                    "from": self.main_app.username, "to": frm,
+                    "sdp": pc.localDescription.sdp, "sdpType": pc.localDescription.type}))
+                asyncio.ensure_future(self._p2p_watchdog(peer))
+            elif data["type"] == "answer":
+                pc = peer.pc
+                if pc is not None and pc.signalingState == "have-local-offer":
+                    await pc.setRemoteDescription(RTCSessionDescription(sdp=data["sdp"], type=data.get("sdpType", "answer")))
+        except Exception as e:
+            self._p2p_fail(peer, f"signaling failed: {e}")
+
+    def dispatch_midi_event(self, ev):
+        """Στέλνει ένα MIDI event: απευθείας (P2P) σε όσους έχουν ενεργό link, μέσω server στους υπόλοιπους."""
+        me = self.main_app.username
+        ev.setdefault("sid", self.p2p_sid)
+        users = self.connected_users or []
+        up = []
+        if self.p2p_active():
+            for u, p in self.p2p_peers.items():
+                if p.state == "up" and p.link is not None and not p.link.broken and (not users or u in users):
+                    p.link.send(ev)
+                    up.append(u)
+        rest = [u for u in users if u != me and u not in up]
+        if (not users or rest) and self.main_app.ws:
+            payload = ev if not up else {**ev, "exclude": up}
+            asyncio.get_event_loop().create_task(self.main_app.ws.send(json.dumps(payload)))
+
+    def send_to_room(self, payload: dict):
+        """Στέλνει message σε όλους στο δωμάτιο μέσω WebSocket (TCP)."""
+        if not self.main_app.ws:
+            return
+        msg = {**payload, "room": self.room_name, "tcp_relay": True}
+        try:
+            asyncio.get_event_loop().create_task(
+                self.main_app.ws.send(json.dumps(msg))
+            )
+        except Exception as e:
+            self.log_manager.log("ERROR", f"⚠️ send_to_room failed: {e}")
+    def open_midi_input_with_retry(self, dev_name, retries=1, delay_ms=0):
+        """Μία μόνο προσπάθεια, ΧΩΡΙΣ sleep (δεν μπλοκάρει Qt/asyncio). Τα retries γίνονται από try_reopen_device."""
+        from mido import open_input
+
+        real_name = resolve_input(dev_name)
+        if not real_name:
+            print(f"⚠️ {dev_name} not visible yet")
+            return None
+        try:
+            print(f"🎹 Opening MIDI input {real_name}")
+            return acquire_input(real_name)
+        except Exception as e:
+            print(f"⚠️ Failed opening {dev_name} ({real_name}): {e}")
+            return None
+
+
+    def _peer_device_name(self, dev_name):
+        """Όνομα συσκευής όπως το βλέπουν οι άλλοι (για loopback του χρήστη με την πλευρά, π.χ. 'Jam Pad (B)')."""
+        return display_name(dev_name)
+
+    def send_streams_announce(self):
+        if not self.main_app.ws:
+            return
+        streams = []
+
+        if getattr(self, "stream_devices", None):
+            for stream_id, dev_name in self.stream_devices.items():
+                streams.append({"stream": stream_id, "device": self._peer_device_name(dev_name)})
+        else:
+            selected_inputs = getattr(self.main_app, "selected_inputs", []) or []
+            for idx, dev_name in enumerate(selected_inputs, start=1):
+                stream_id = self.main_app.make_stream_id(dev_name, idx)
+                streams.append({"stream": stream_id, "device": self._peer_device_name(dev_name)})
+
+        self.send_to_room({
+            "type": "streams_announce",
+            "user": self.main_app.username,
+            "streams": streams
+        })
+        self.log_manager.log("SYSTEM", "📣 Sent streams_announce via TCP")
+
+    def bump_velocity_bar(self, username: str, velocity: int):
+        """Peak-hold + ομαλή πτώση. Ανεβαίνει αμέσως στην υψηλότερη velocity που ήρθε και πέφτει
+        σταδιακά, ώστε γρήγορες νότες/συγχορδίες να φαίνονται (πριν, κάθε μήνυμα αντικαθιστούσε το
+        προηγούμενο και πολλά δεν προλάβαιναν να ζωγραφιστούν)."""
+        bar = self.user_velocity_bars.get(username)
+        if not bar:
+            return
+        v = int(velocity or 0)
+        if v <= 0:
+            return          # το note_off / velocity 0 δεν ρίχνει τη μπάρα (αφήνουμε τη φυσική πτώση)
+
+        if not hasattr(self, "_vel_levels"):
+            self._vel_levels = {}
+        level = max(self._vel_levels.get(username, 0.0), float(v))
+        self._vel_levels[username] = level
+        bar.setValue(int(level))
+
+        t = getattr(self, "_vel_decay_timer", None)
+        if t is None:
+            t = QtCore.QTimer(self)
+            t.timeout.connect(self._decay_velocity_bars)
+            self._vel_decay_timer = t
+        if not t.isActive():
+            t.start(30)
+
+    def _decay_velocity_bars(self):
+        levels = getattr(self, "_vel_levels", {})
+        alive = False
+        for user in list(levels.keys()):
+            bar = self.user_velocity_bars.get(user)
+            new = levels[user] * 0.82 - 0.5
+            if new <= 0 or not bar:
+                levels.pop(user, None)
+                if bar:
+                    bar.setValue(0)
+                continue
+            levels[user] = new
+            bar.setValue(int(new))
+            alive = True
+        if not alive:
+            self._vel_decay_timer.stop()
+
+    def preferred_remote_port(self, user: str, stream: str) -> str | None:
+        meta = getattr(self.main_app, "stream_meta", {}).get((user, stream), {})
+        room = meta.get("room", self.room_name)
+        device = meta.get("device", "UnknownDevice")
+
+        pool = getattr(self.main_app, "remote_port_pool", [])
+        if not pool:
+            return None
+
+        key_str = f"{room}|{user}|{device}|{stream}"
+        idx = abs(hash(key_str)) % len(pool)
+        return pool[idx]
+
+    def open_routing_manager(self):
+        dlg = RoutingManager(self.main_app)
+        self.main_app.routing_manager_dialog = dlg
+        dlg.exec_()
+        self.main_app.routing_manager_dialog = None
+
+    def scan_new_midi_inputs(self):
+        import mido
+        from mido import open_input
+
+        if self._left:
+            return
+
+        selected_inputs = list(getattr(self.main_app, "selected_inputs", []) or [])
+        if not selected_inputs:
+            return  # ✅ don't auto-open devices unless user selected them in settings
+
+        # Σύγκριση με base_name (χωρίς το index του WinMM που αλλάζει)
+        opened_bases = {base_name(n) for n in self.stream_devices.values() if n}
+        failed = getattr(self, "failed_inputs", set())
+
+        new_devices = [
+            d for d in selected_inputs
+            if base_name(d) not in opened_bases
+            and d.lower() not in failed
+            and resolve_input(d)          # μόνο όσες φαίνονται τώρα στο σύστημα
+        ]
+
+        if not new_devices:
+            return
+
+        for dev_name in new_devices:
+            try:
+                def make_stream_id(dev_name: str, idx: int) -> str:
+                    base = "".join(c if c.isalnum() else "_" for c in (display_name(dev_name) or "device")).strip("_")
+                    base = "_".join(base.split("_"))
+                    base = base[:24] if base else f"dev{idx}"
+                    return f"{base}_{idx}"
+
+                stream_id = make_stream_id(dev_name, len(self.midi_inputs) + 1)
+
+                inport = self.open_midi_input_with_retry(dev_name, retries=1, delay_ms=100)
+                if not inport:
+                    print(f"⚠️ Hotplug: {dev_name} δεν είναι ακόμα διαθέσιμη, θα ξαναδοκιμαστεί")
+                    continue  # ΔΕΝ βάζουμε στο failed_inputs — ο επόμενος κύκλος θα ξαναδοκιμάσει
+                self.midi_inputs.append((stream_id, inport))
+                self.stream_devices[stream_id] = dev_name
+                print(f"➕ Hotplug: opened {stream_id} = {dev_name}")
+
+                # ειδοποίηση επανασύνδεσης στο UI log
+                self.log_manager.log("DEVICE", f"✅ MIDI device reconnected: {dev_name} — ready to use")
+                # ενημέρωσε τον πίνακα αν είναι ανοιχτός
+                if getattr(self.main_app, "routing_manager_dialog", None):
+                    self.main_app.routing_manager_dialog.refresh_table()
+
+                # announce updated stream list to peers
+                self.send_streams_announce()
+
+            except Exception as e:
+                print(f"⚠️ Hotplug: failed to open {dev_name}: {e}")
+
+    def try_reopen_device(self, dev_name: str, attempt: int = 1):
+        """
+        Ασύγχρονη επαναφορά συσκευής — δεν μπλοκάρει το Qt thread.
+        Χρησιμοποιεί singleShot για να επαναλαμβάνεται χωρίς blocking.
+        """
+        MAX_ATTEMPTS = 20  # δοκίμασε έως 20 φορές (60 δευτερόλεπτα συνολικά)
+
+        # αν έχουμε φύγει από το δωμάτιο, μην ξανανοίξεις τίποτα
+        if self._left:
+            return
+
+        # αν έχει ήδη ξανανοιχτεί, σταμάτα (σύγκριση χωρίς το index του WinMM)
+        already_open = any(
+            base_name(self.stream_devices.get(sid, "")) == base_name(dev_name)
+            for sid, _ in self.midi_inputs
+        )
+        if already_open:
+            return
+
+        # αν δεν είναι επιλεγμένη, σταμάτα
+        selected = set(getattr(self.main_app, "selected_inputs", []) or [])
+        if dev_name not in selected:
+            return
+
+        if attempt > MAX_ATTEMPTS:
+            self.log_manager.log("DEVICE", f"❌ Could not reconnect {dev_name} after {MAX_ATTEMPTS} attempts.")
+            print(f"❌ Giving up on {dev_name}")
+            return
+
+        # Force WinMM να ξαναδεί τις συσκευές
+        force_winmm_refresh()
+
+        # exact match, αλλιώς match με base_name (το index στο τέλος αλλάζει)
+        real_name = resolve_input(dev_name)
+
+        if not real_name:
+            # δεν φαίνεται ακόμα — ξαναδοκίμασε σε 3 δευτερόλεπτα
+            print(f"⏳ [{attempt}/{MAX_ATTEMPTS}] {dev_name} not visible yet, retrying...")
+            QtCore.QTimer.singleShot(
+                3000, lambda: self.try_reopen_device(dev_name, attempt + 1)
+            )
+            return
+
+        # φαίνεται — προσπάθησε να την ανοίξεις
+        try:
+            from mido import open_input
+            inport = acquire_input(real_name)
+
+            stream_id = self.main_app.make_stream_id(dev_name, len(self.midi_inputs) + 1)
+            self.midi_inputs.append((stream_id, inport))
+            self.stream_devices[stream_id] = dev_name
+            self.failed_inputs.discard(dev_name.lower())
+
+            self.log_manager.log("DEVICE", f"✅ MIDI device reconnected: {dev_name} — ready to use")
+            print(f"✅ Reopened {dev_name} as {stream_id}")
+
+            if getattr(self.main_app, "routing_manager_dialog", None):
+                self.main_app.routing_manager_dialog.refresh_table()
+
+            self.send_streams_announce()
+
+        except Exception as e:
+            # η συσκευή φαίνεται αλλά δεν ανοίγει ακόμα — ξαναδοκίμασε
+            print(f"⏳ [{attempt}/{MAX_ATTEMPTS}] {dev_name} visible but not openable yet: {e}")
+            QtCore.QTimer.singleShot(
+                3000, lambda: self.try_reopen_device(dev_name, attempt + 1)
+            )
+
+    async def send_ping(self):
+        """Συγχρονισμός με το ρολόι του server (server = master clock)."""
+        if not self.main_app.ws:
+            return
+        try:
+            # στέλνει απευθείας στον server (όχι relay), με τον τοπικό χρόνο t0
+            await self.main_app.ws.send(json.dumps({
+                "type": "clock_sync",
+                "t0": time.perf_counter(),
+            }))
+        except Exception as e:
+            print("⚠️ Failed to send clock_sync:", e)
+
+    def handle_clock_sync(self, data):
+        """Υπολογίζει το offset από το ρολόι του server (NTP-style)."""
+        t2 = time.perf_counter()
+        t0 = data.get("t0")
+        server_time = data.get("server_time")
+        if t0 is None or server_time is None:
+            return
+
+        rtt = t2 - t0
+        # εκτίμηση: όταν ο server κατέγραψε server_time, ο τοπικός μας χρόνος ήταν t0 + rtt/2
+        estimated_local_at_server = t0 + rtt / 2.0
+        offset = server_time - estimated_local_at_server
+
+        # Offset από το δείγμα με το ΜΙΚΡΟΤΕΡΟ RTT των τελευταίων SYNC_WINDOW μετρήσεων:
+        # μικρότερο RTT = μικρότερη ασυμμετρία διαδρομής = ακριβέστερη εκτίμηση ρολογιού.
+        samples = getattr(self, "_sync_samples", [])
+        samples.append((rtt, offset))
+        self._sync_samples = samples[-SYNC_WINDOW:]
+        self.server_clock_offset = min(self._sync_samples, key=lambda x: x[0])[1]
+        offset = self.server_clock_offset      # για το log παρακάτω
+
+
+        # jitter tracking
+        rtt_ms = rtt * 1000
+        self.server_rtt_samples.append(rtt_ms)
+        self.server_rtt_samples = self.server_rtt_samples[-20:]
+        if len(self.server_rtt_samples) > 2:
+            jitter_ms = statistics.stdev(self.server_rtt_samples)
+            self.peer_jitter["_server"] = jitter_ms / 1000.0
+        else:
+            jitter_ms = 0.0
+
+        oneway_ms = rtt_ms / 2.0
+        # ενημέρωσε το UI (δείχνει latency προς server)
+        if hasattr(self, "ui"):
+            self.log_manager.log("CLOCK",
+                                 f"🕒 Server sync: latency={oneway_ms:.1f}ms jitter={jitter_ms:.1f}ms offset={offset * 1000:.1f}ms"
+                                 )
+    def handle_pong(self, data):
+        return
+
+    def on_datachannel(self, channel):
+        return
+        self.channel = channel
+        print(f"📥 DataChannel received by {self.main_app.username}")
+
+        @channel.on("open")
+        def on_open():
+            print("✅ DataChannel opened (receiver)")
+            self.send_streams_announce()
+
+        channel.on("message", self.on_midi_message)
+
+        # ✅ IMPORTANT: sometimes channel is already open before handlers attach
+        if getattr(channel, "readyState", None) == "open":
+            print("✅ DataChannel already open (receiver) — announcing streams now")
+            self.send_streams_announce()
+        else:
+            # also send once after a tiny delay as a safety net
+            QtCore.QTimer.singleShot(200, self.send_streams_announce)
+
+    def closeEvent(self, event):
+        """Το Χ του παραθύρου του δωματίου = Leave Room. Χωρίς αυτό το παράθυρο έκλεινε αλλά το δωμάτιο
+        έμενε ενεργό (timers, websocket, ports) και η εφαρμογή συνέχιζε να τρέχει χωρίς παράθυρο."""
+        if not self._left:
+            try:
+                self.leave_room()        # κάνει cleanup και ξαναδείχνει το κύριο παράθυρο
+            except Exception as e:
+                print(f"⚠️ leave_room from closeEvent failed: {e}")
+                try:
+                    self.main_app.show()
+                except Exception:
+                    pass
+        event.accept()
+
+    def _make_users_layout_horizontal(self):
+        """Οι χρήστες του δωματίου μπαίνουν ο ένας δίπλα στον άλλον (όχι κάτω από τον άλλον)."""
+        try:
+            parent_layout = self.ui.verticalLayout_3
+            old = self.ui.uservelocityLayout
+            new = QtWidgets.QHBoxLayout()
+            new.setAlignment(QtCore.Qt.AlignLeft | QtCore.Qt.AlignTop)
+            idx = parent_layout.indexOf(old)
+            parent_layout.removeItem(old)
+            parent_layout.insertLayout(max(idx, 0), new)
+            old.deleteLater()
+            self.ui.uservelocityLayout = new
+            self.ui.scrollArea.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        except Exception as e:
+            print(f"⚠️ Could not make users layout horizontal: {e}")
+
+    def _auto_start_room_log(self):
+        """Προεπιλογή: το log του δωματίου αποθηκεύεται σε CSV στον φάκελο όπου τρέχει η εφαρμογή.
+        Απενεργοποιείται από Log Settings -> Stop Saving."""
+        import os, re as _re
+        try:
+            safe = lambda x: _re.sub(r"[^A-Za-z0-9_-]+", "_", str(x))
+            fname = f"midirooms_log_{safe(self.main_app.username)}_{safe(self.room_name)}_{_dt.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            self.log_manager.start_file(os.path.join(os.getcwd(), fname))
+        except Exception as e:
+            print(f"⚠️ Could not auto-start room log: {e}")
+
+    def leave_room(self):
+        if self._left:
+            return          # ήδη έχουμε φύγει (π.χ. kicked + leave)
+        self._left = True
+        try:
+            self.exp.stop()            # κλείσιμο των experiment CSV
+        except Exception:
+            pass
+        try:
+            self.log_manager.stop_file()   # κλείσιμο του log του δωματίου
+        except Exception:
+            pass
+        if hasattr(self, "piano"):
+            self.piano.clear_all()
+
+        # σταμάτα ΟΛΑ τα timers πρώτα (προηγουμένως έμεναν ενεργά το
+        # remote_playback_timer και το metronome_timer)
+        for _t in ("timer", "ping_timer", "hotplug_timer", "announce_timer",
+                   "remote_playback_timer", "metronome_timer"):
+            try:
+                getattr(self, _t).stop()
+            except Exception:
+                pass
+        self.remote_midi_queue.clear()
+
+        if self.main_app.ws:
+            asyncio.get_event_loop().create_task(
+                self.main_app.ws.send(json.dumps({
+                    "type": "leave",
+                    "room": self.room_name,
+                    "user": self.main_app.username
+                }))
+            )
+
+        self.p2p_close_all()
+
+        # κλείσε channel και pc πριν τα μηδενίσεις
+        try:
+            if self.channel:
+                self.channel.close()
+        except Exception:
+            pass
+        try:
+            if self.pc:
+                asyncio.ensure_future(self.pc.close())
+        except Exception:
+            pass
+
+        self.pc = None
+        self.channel = None
+        self.offer_sent = False
+        # Stop timers first
+        try:
+            self.timer.stop()
+            self.ping_timer.stop()
+        except Exception:
+            pass
+        try:
+            self.hotplug_timer.stop()
+        except Exception:
+            pass
+        try:
+            self.announce_timer.stop()
+        except Exception:
+            pass
+        # Τα virtual ports ΔΕΝ κλείνουν στο Leave: ανήκουν στο pool της εφαρμογής και
+        # μένουν ανοιχτά μέχρι να κλείσει η εφαρμογή (routing_config.clear() παρακάτω
+        # Close all MIDI inputs — πρώτα αποσύνδεσέ τα από τη λίστα, μετά κλείσε
+        _ports = list(self.midi_inputs)
+        self.midi_inputs = []
+        self.stream_devices = {}
+        # κλείσιμο με μικρή καθυστέρηση (300ms): δίνει χρόνο στον driver να επιστρέψει τα buffers
+        # και αποφεύγει το σφάλμα midiInUnprepareHeader όταν ο player στέλνει ακόμα δεδομένα
+        # Τα MIDI inputs ΔΕΝ κλείνουν στο Leave (το close() στο WinMM/WMS αποτυγχάνει με
+        # midiInUnprepareHeader). Μένουν ανοιχτά "parked" και ξαναχρησιμοποιούνται στο επόμενο join.
+        if PARK_INPUTS_ON_LEAVE:
+            for _sid, _p in _ports:
+                print(f"🅿️ Parking MIDI input {_sid} (kept open)")
+                park_input(_p)
+        else:
+            def _close_all(ports=_ports):
+                for _sid, _p in ports:
+                    print(f"🔌 Closing MIDI input {_sid}")
+                    ok = safe_close_port(_p, _sid)
+                    print(f"   → close {'OK' if ok else 'FAILED'} for {_sid}")
+            QtCore.QTimer.singleShot(300, _close_all)
+        # κλείσε τα ports όλων των απομακρυσμένων streams πριν καθαριστεί το routing
+        try:
+            for key in list(self.main_app.routing_config):
+                self._drop_remote_stream(key)
+        except Exception as e:
+            print("⚠️ closing remote ports on leave failed:", e)
+        try:
+            self.main_app.routing_config.clear()
+            self.main_app.locked_routes.clear()
+            self.main_app.seen_streams.clear()
+            self.main_app.stream_meta.clear()
+            self.main_app.stream_pretty.clear()
+            self.main_app.stream_portname.clear()
+            self.main_app.room_leader = None
+        except Exception:
+            pass
+        self.main_app.show()
+        # (το metronome port μένει ανοιχτό: ανήκει στην εφαρμογή, όχι στο δωμάτιο)
+        try:
+            for out in getattr(self, "local_output_cache", {}).values():
+                try:
+                    out.close()
+                except Exception:
+                    pass
+            self.local_output_cache.clear()
+        except Exception:
+            pass
+        # το main_app να μην κρατά αναφορά στο κλειστό παράθυρο
+        # (αλλιώς το listen_for_rooms συνεχίζει να του δίνει μηνύματα)
+        if getattr(self.main_app, "room_window", None) is self:
+            self.main_app.room_window = None
+        self.close()
+
+    async def start_webrtc(self):
+        # Το όνομα διατηρείται για συμβατότητα — πλέον στέλνει μόνο το join.
+        # Όλη η επικοινωνία γίνεται μέσω WebSocket (TCP), όχι WebRTC.
+        if not self.main_app.ws:
+            print("No signaling connection")
+            return
+
+        await self.main_app.ws.send(json.dumps({
+            "type": "join",
+            "room": self.room_name,
+            "user": self.main_app.username
+        }))
+        print(f"🟢 {self.main_app.username} joined room '{self.room_name}' (TCP mode)")
+
+    def poll_midi_input(self):
+        if not self.midi_inputs:
+            return
+        for stream_id, inport in list(self.midi_inputs):
+            try:
+                pending = list(inport.iter_pending())
+                input_ts = time.perf_counter()
+            except Exception as e:
+                print(f"⚠️ MIDI input disconnected: {stream_id}: {e}")
+
+                safe_close_port(inport, stream_id)
+
+                lost_dev = self.stream_devices.get(stream_id)
+
+                self.midi_inputs = [
+                    (sid, port) for sid, port in self.midi_inputs if sid != stream_id
+                ]
+
+                self.stream_devices.pop(stream_id, None)
+
+                # αφαίρεσε από failed_inputs ώστε το hotplug να μπορεί να την ξανανοίξει
+                if lost_dev:
+                    self.failed_inputs.discard(lost_dev.lower())
+                    print(f"🔌 Συσκευή αποσυνδέθηκε: {lost_dev} — αναμένουμε επανασύνδεση")
+                    self.log_manager.log("DEVICE",f"⚠️ MIDI device disconnected: {lost_dev} — waiting for reconnect...")
+                    if getattr(self.main_app, "routing_manager_dialog", None):
+                        self.main_app.routing_manager_dialog.refresh_table()
+                    # ξεκίνα αυτόματη ασύγχρονη επαναφορά
+                    QtCore.QTimer.singleShot(
+                        3000, lambda d=lost_dev: self.try_reopen_device(d)
+                    )
+
+                continue
+
+            for msg in pending:
+
+                if msg.type in ("note_on", "note_off"):
+                    input_ts = time.perf_counter()
+                    me = self.main_app.username
+                    note = getattr(msg, "note", None)
+                    velocity = getattr(msg, "velocity", None)
+                    self.record_midi_event(
+                        user=me,
+                        stream=stream_id,
+                        msg_type=msg.type,
+                        note=note,
+                        velocity=velocity,
+                        channel=getattr(msg, "channel", 0)
+                    )
+                    # --- Local visualization ---
+                    self.log_manager.log("MY_MIDI", f"{me}/{stream_id}: {msg.type} note={note} vel={velocity}")
+                    if hasattr(self, "piano"):
+                        # ΜΟΝΟ το note_on με velocity>0 ανάβει. Το note_off μπορεί να έχει velocity>0
+                        # (release velocity) και πρέπει να σβήνει το πλήκτρο.
+                        self.piano.note_event(getattr(msg, "channel", 0), note,
+                                              msg.type == "note_on" and (velocity or 0) > 0)
+                    if not self.local_mute and msg.type == "note_on":
+                        self.bump_velocity_bar(me, velocity)
+                    if self.local_mute:
+                        continue
+                    # --- Send to others over WebRTC ---
+                    # Skip network-originated messages (to prevent echo)
+                    if getattr(msg, "_from_network", False):
+                        continue  # don't resend notes that came from network
+
+                    if self.main_app.ws:
+                        self.midi_seq += 1
+                        midi_event = {
+                            "user": me,
+                            "stream": stream_id,
+                            "seq": self.midi_seq,
+                            "timestamp": time.perf_counter() + self.server_clock_offset,
+                            "input_ts": input_ts,
+                            "note": note,
+                            "velocity": velocity,
+                            "type": msg.type,
+                            "channel": getattr(msg, "channel", 0),  # 0..15
+                            "room": self.room_name,
+                            "tcp_midi": True,  # flag για τον server να το κάνει relay
+                        }
+                        self.exp.log_sent(self.midi_seq, stream_id, msg.type, getattr(msg, "channel", 0),
+                                          note, velocity, midi_event["timestamp"] - self.server_clock_offset,
+                                          input_ts)
+                        self.dispatch_midi_event(midi_event)
+                    else:
+                        print("⏳ WebSocket not connected, skipping send")
+
+                elif msg.type in CHANNEL_MSG_FIELDS:
+                    # program change / CC / pitch bend / aftertouch: κρατούν το κανάλι και το όργανο
+                    if msg.type == "control_change" and getattr(msg, "control", None) in (120, 123) \
+                            and hasattr(self, "piano"):
+                        self.piano.clear_channel(getattr(msg, "channel", 0))
+                    if getattr(msg, "_from_network", False) or self.local_mute:
+                        continue
+                    params = {f: getattr(msg, f) for f in CHANNEL_MSG_FIELDS[msg.type]}
+                    self.record_midi_event(
+                        user=self.main_app.username, stream=stream_id, msg_type=msg.type,
+                        channel=getattr(msg, "channel", 0), extra=params)
+                    if self.main_app.ws:
+                        self.midi_seq += 1
+                        ev = {
+                            "user": self.main_app.username,
+                            "stream": stream_id,
+                            "seq": self.midi_seq,
+                            "timestamp": time.perf_counter() + self.server_clock_offset,
+                            "type": msg.type,
+                            "channel": getattr(msg, "channel", 0),
+                            "params": params,
+                            "room": self.room_name,
+                            "tcp_midi": True,
+                        }
+                        self.dispatch_midi_event(ev)
+
+    def assign_leader(self, target_user: str):
+        # only current leader can assign
+        if getattr(self.main_app, "room_leader", None) != self.main_app.username:
+            return
+        if not self.main_app.ws:
+            return
+
+        asyncio.get_event_loop().create_task(
+            self.main_app.ws.send(json.dumps({
+                "type": "assign_leader",
+                "room": self.room_name,
+                "target": target_user
+            }))
+        )
+
+    def update_leader_ui(self, leader: str | None):
+        # store on main_app so add_user_ui() can read it
+        self.main_app.room_leader = leader
+
+        is_leader = (leader == self.main_app.username)
+
+        # ένδειξη "(leader)" δίπλα στο όνομα του leader
+        for user, lbl in self.user_name_labels.items():
+            lbl.setText(f"{user} (leader)" if (leader and user == leader) else user)
+
+        for user, container in self.user_ui_elements.items():
+            # find the Assign Leader button inside this user's widget
+            btns = container.findChildren(QtWidgets.QPushButton)
+            for b in btns:
+                if b.text() in ("Assign Leader", "Kick"):
+                    b.setVisible(is_leader and user != self.main_app.username)
+        leader_controls_enabled = is_leader
+        self.ui.bpmSpinBox.setEnabled(leader_controls_enabled)
+        self.ui.applyBpmButton.setEnabled(leader_controls_enabled)
+        self.ui.startMetronomeButton.setEnabled(leader_controls_enabled)
+        self.ui.stopMetronomeButton.setEnabled(leader_controls_enabled)
+
+    def open_log_settings(self):
+        dlg = LogSettingsDialog(self)
+        dlg.exec_()
+
+    def on_midi_message(self, message):
+        if self._left:
+            return
+        port_name = None
+        try:
+            data = json.loads(message)
+
+            if data.get("type") == "metronome_start":
+                self.start_local_metronome(
+                    data.get("bpm", 120),
+                    data.get("start_time")
+                )
+                print("▶️ Received metronome_start:", data)
+                return
+
+            if data.get("type") == "metronome_stop":
+                self.stop_local_metronome()
+                print("⏹️ Received metronome_stop")
+                return
+
+            if data.get("type") == "metronome_bpm_update":
+                bpm = data.get("bpm", 120)
+                self.metronome_bpm = bpm
+                self.ui.bpmSpinBox.setValue(bpm)
+                print("🎚️ Received BPM update:", bpm)
+                return
+            # --- Handle streams announcement (auto-routing) ---
+            if data.get("type") == "streams_announce":
+                sender = data.get("user")
+                room = data.get("room", self.room_name)
+                streams = data.get("streams", [])
+
+                if not sender or sender == self.main_app.username:
+                    return
+
+                app = self.main_app
+                announced = {s.get("stream", "kbd1"): s.get("device", "Unknown Device") for s in streams}
+
+                # 1) streams που αφαιρέθηκαν ή άλλαξαν συσκευή → κλείνει το ζεύγος
+                for key in [k for k in list(app.routing_config) if k[0] == sender]:
+                    old_dev = app.stream_meta.get(key, {}).get("device")
+                    if key[1] not in announced or announced[key[1]] != old_dev:
+                        self._drop_remote_stream(key)
+
+                # 2) νέα streams → ανοίγει ζεύγος
+                for stream, device in announced.items():
+                    key = (sender, stream)
+                    app.seen_streams.add(key)
+                    app.stream_meta[key] = {"device": device, "room": room}
+                    app.stream_pretty[key] = f"{sender} — {display_name(device)}"
+
+                    if app.routing_config.get(key, {}).get("vmidi"):
+                        continue  # υπάρχει ήδη port
+
+                    name = app.open_remote_port(key, device)
+                    if not name:
+                        print(f"❌ Could not create virtual port for {key}")
+                        continue
+                    app.routing_config[key] = {"vmidi": name, "channel": None}
+                    app.locked_routes.add(key)
+                    app.stream_portname[key] = name
+                    print(f"🔒 Opened port for {key}: {name}")
+
+                if getattr(app, "routing_manager_dialog", None):
+                    app.routing_manager_dialog.refresh_table()
+                return
+
+            # --- Handle ping/pong control ---
+            if data.get("type") == "sync_ping" and data.get("to") == self.main_app.username:
+
+                reply = {
+                    "type": "sync_pong",
+                    "from": self.main_app.username,
+                    "to": data["from"],
+                    "t0": data["t0"],
+                    "t1": time.perf_counter(),
+                }
+
+                self.send_to_room(reply)
+
+                return
+
+            if data.get("type") == "sync_pong" and data.get("to") == self.main_app.username:
+                t2 = time.perf_counter()
+                t0 = data.get("t0")
+                t1 = data.get("t1")
+                sender = data.get("from")
+                rtt = t2 - t0
+                offset = t1 - ((t0 + t2) / 2)
+                self.clock_offset_from_peer[sender] = offset
+                rtt_ms = rtt * 1000
+                oneway_ms = rtt_ms / 2
+                self.rtt_samples.setdefault(sender, []).append(oneway_ms)
+                self.rtt_samples[sender] = self.rtt_samples[sender][-20:]
+                if len(self.rtt_samples[sender]) > 2:
+                    jitter_ms = statistics.stdev(self.rtt_samples[sender])
+                    self.peer_jitter[sender] = jitter_ms / 1000.0  # store in seconds
+                else:
+                    jitter_ms = 0.0
+
+                if sender in self.user_latency_labels:
+                    self.user_latency_labels[sender].setText(
+                        f"Latency: {oneway_ms:.1f} ms  |  Jitter: {jitter_ms:.1f} ms"
+                    )
+                print(f"🕒 Sync {sender} | RTT={rtt_ms:.1f} ms | one-way={oneway_ms:.1f} ms | offset={offset * 1000:.1f} ms | jitter={jitter_ms:.1f} ms")
+
+                return
+
+            # --- Skip my own loopback ---
+            if data.get("user") == self.main_app.username:
+                return
+
+            # Διπλότυπα: το ίδιο event μπορεί να φτάσει και P2P και από τον server (π.χ. στο fallback)
+            if data.get("tcp_midi") and data.get("seq") is not None:
+                dk = (data.get("user"), data.get("sid"), data.get("stream"), data.get("seq"))
+                if dk in self._dedup:
+                    return
+                self._dedup.add(dk)
+                self._dedup_q.append(dk)
+                if len(self._dedup_q) > 8192:
+                    self._dedup.discard(self._dedup_q.popleft())
+
+            # Mark this message as coming from the network
+            data["_from_network"] = True
+            user = data.get("user", "Unknown")
+            stream = data.get("stream", "kbd1")  # default for older senders
+            seq = data.get("seq")
+            if seq is not None:
+                key = (user, stream)
+                last = self.last_seq_from_peer.get(key)
+
+                if last is not None and seq != last + 1:
+                    missing = seq - last - 1
+                    if missing > 0:
+                        print(f"⚠️ Missing {missing} MIDI packets from {user}/{stream}: expected {last + 1}, got {seq}")
+
+                self.last_seq_from_peer[key] = seq
+            note = data.get("note")
+            velocity = data.get("velocity")
+            msg_type = data.get("type")
+            ch = data.get("channel", 0)
+            try:
+                ch = max(0, min(15, int(ch)))
+            except (TypeError, ValueError):
+                ch = 0
+
+            if msg_type in CHANNEL_MSG_FIELDS:
+                params = data.get("params") or {}
+                self.record_midi_event(user=user, stream=stream, msg_type=msg_type,
+                                       channel=ch, extra=params)
+                sender_ts_server = data.get("timestamp", time.perf_counter())
+                if self.server_clock_offset == 0.0:
+                    sender_ts_local = time.perf_counter()
+                else:
+                    sender_ts_local = sender_ts_server - self.server_clock_offset
+                jitter_s = self.peer_jitter.get("_server", 0.005)
+                play_time = self._compute_play_time(sender_ts_local)
+                self.remote_midi_queue.append({
+                    "play_time": play_time, "user": user, "stream": stream,
+                    "type": msg_type, "channel": ch, "params": params,
+                })
+                self.remote_midi_queue.sort(key=lambda e: e["play_time"])
+                return
+
+            self.record_midi_event(
+                user=user,
+                stream=stream,
+                msg_type=msg_type,
+                note=note,
+                velocity=velocity,
+                channel=ch
+            )
+
+            # Update velocity bar
+            if note is not None:
+                effective_velocity = velocity if velocity is not None else 0
+
+                if velocity is not None and msg_type == "note_on":
+                    self.bump_velocity_bar(user, velocity)
+
+                sender_ts_server = data.get("timestamp", time.perf_counter())
+                if self.server_clock_offset == 0.0:
+                    # ο συγχρονισμός ρολογιού δεν έχει ολοκληρωθεί ακόμα —
+                    # παίξε άμεσα αντί να υπολογίσεις λάθος (τεράστιο) play_time
+                    sender_ts_local = time.perf_counter()
+                else:
+                    sender_ts_local = sender_ts_server - self.server_clock_offset
+
+                jitter_s = self.peer_jitter.get("_server", 0.005)
+                play_time = self._compute_play_time(sender_ts_local)
+                exp_rec = None
+                if self.exp.active:
+                    arrival = self._last_arrival
+                    transit_ms = (arrival - sender_ts_local) * 1000.0
+                    delay_ms = (self.buffer_base_s + self.buffer_extra_s) * 1000.0     # buffer που εφαρμόστηκε (μετά την ανύψωση)
+                    pre_delay_ms = self._last_pre_delay_s * 1000.0                    # buffer πριν την ανύψωση
+                    exp_rec = {
+                        "late": int(self._last_late),
+                        "seq": seq, "user": user, "stream": stream, "type": msg_type,
+                        "ch": ch, "note": note, "vel": effective_velocity,
+                        "arrival_s": f"{arrival:.6f}", "sender_ts_s": f"{sender_ts_local:.6f}",
+                        "transit_est_ms": f"{transit_ms:.3f}",
+                        "buf_base_ms": f"{self.buffer_base_s * 1000.0:.1f}",
+                        "buf_extra_ms": f"{self.buffer_extra_s * 1000.0:.1f}",
+                        "delay_ms": f"{delay_ms:.1f}",
+                        "slack_ms": f"{pre_delay_ms - transit_ms:.3f}",
+                        "play_time_s": f"{play_time:.6f}",
+                        "adaptive": int(self.adaptive_buffer),
+                        "server_offset_ms": f"{self.server_clock_offset * 1000.0:.2f}",
+                        "server_jitter_ms": f"{self.peer_jitter.get('_server', 0.0) * 1000.0:.2f}",
+                        "status": "nosync" if self.server_clock_offset == 0.0 else "ok",
+                        "via": data.get("_via", "relay"),
+                    }
+                print(f"CALC ts_server={sender_ts_server:.1f} my_offset={self.server_clock_offset:.1f} play_time={play_time:.1f} now={time.perf_counter():.1f} diff={play_time-time.perf_counter():.3f}")
+                is_noteoff = (msg_type == "note_off" or
+                              (msg_type == "note_on" and effective_velocity == 0))
+
+                if not hasattr(self, "last_noteon_playtime"):
+                    self.last_noteon_playtime = {}
+
+                key_note = (user, stream, ch, note)
+
+                if is_noteoff:
+                    # εγγύηση: note_off ΠΟΤΕ πριν το note_on του ίδιου note
+                    last_on = self.last_noteon_playtime.get(key_note, 0.0)
+                    if play_time <= last_on:
+                        play_time = last_on + 0.001  # 1ms μετά το note_on
+                else:
+                    self.last_noteon_playtime[key_note] = play_time
+
+                self.remote_midi_queue.append({
+                    "play_time": play_time,
+                    "user": user,
+                    "stream": stream,
+                    "type": msg_type,
+                    "note": note,
+                    "velocity": effective_velocity,
+                    "channel": ch,
+                    "_rec": exp_rec,
+                })
+
+                self.remote_midi_queue.sort(key=lambda e: e["play_time"])
+            # --- GUI Piano highlight ---
+            self.log_manager.log(None, f"{user}/{stream}: {msg_type} note={note} vel={velocity}", peer=user)
+            if hasattr(self, "piano"):
+                if msg_type == "note_on" and velocity is not None and velocity > 0:
+                    self.piano._highlight(note, True)
+                    QtCore.QTimer.singleShot(200, lambda n=note: self.piano._highlight(n, False))
+
+        except Exception as e:
+            print("❌ Failed to parse MIDI message:", e)
+
+    def _init_buffer_controls(self):
+        """Slider για τη βάση του buffer + checkbox για το adaptive (leaky max)."""
+        self.buffer_base_s = BUFFER_MS / 1000.0
+        self.buffer_extra_s = 0.0
+        self.adaptive_buffer = ADAPTIVE_BUFFER
+        self._extra_last_ts = time.perf_counter()
+
+        self.bufferLabel = QtWidgets.QLabel(f"Buffer: {BUFFER_MS} ms", self)
+        self.bufferLabel.setMinimumWidth(110)
+        self.bufferSlider = QtWidgets.QSlider(QtCore.Qt.Horizontal, self)
+        self.bufferSlider.setRange(BUFFER_MIN_MS, BUFFER_MAX_MS)
+        self.bufferSlider.setValue(BUFFER_MS)
+        self.bufferSlider.setFixedWidth(120)
+        self.bufferSlider.setToolTip("Βάση buffer (ms) από τη στιγμή που πατήθηκε η νότα μέχρι να παιχτεί")
+        self.adaptiveCheck = QtWidgets.QCheckBox("Adaptive", self)
+        self.adaptiveCheck.setChecked(self.adaptive_buffer)
+        self.adaptiveCheck.setToolTip("Όταν μια νότα έρθει αργά, το buffer ανεβαίνει προσωρινά και μετά επιστρέφει αργά στη βάση")
+
+        self.ui.horizontalLayout.addWidget(self.bufferLabel)
+        self.ui.horizontalLayout.addWidget(self.bufferSlider)
+        self.ui.horizontalLayout.addWidget(self.adaptiveCheck)
+
+        # Καταγραφή μετρήσεων: ένα ζευγάρι CSV (RECEIVED + SENT) ανά Start/Stop
+        self.exp = ExperimentRecorder()
+        self._last_arrival = time.perf_counter()
+        self._last_pre_delay_s = self.buffer_base_s
+        self._last_late = False
+        self.recordCsvCheck = QtWidgets.QCheckBox("Record CSV", self)
+        self.recordCsvCheck.setToolTip("Ξεκινά/σταματά την καταγραφή μετρήσεων ανά νότα (experiment_RECEIVED/SENT_*.csv)")
+        self.ui.horizontalLayout.addWidget(self.recordCsvCheck)
+        self.recordCsvCheck.toggled.connect(self._on_record_csv_toggled)
+
+        self.bufferSlider.valueChanged.connect(self._on_buffer_slider)
+        self.adaptiveCheck.toggled.connect(self._on_adaptive_toggled)
+
+        self.buffer_label_timer = QtCore.QTimer(self)
+        self.buffer_label_timer.timeout.connect(self._refresh_buffer_label)
+        self.buffer_label_timer.start(500)
+
+    def _on_record_csv_toggled(self, checked):
+        if checked:
+            if self.adaptive_buffer:
+                tag = f"adaptive{int(round(self.buffer_base_s * 1000))}"
+            else:
+                tag = f"fixed{int(round(self.buffer_base_s * 1000))}"
+            self.exp.start(self.main_app.username, tag)
+            self.recordCsvCheck.setText("Recording...")
+        else:
+            self.exp.stop()
+            self.recordCsvCheck.setText("Record CSV")
+
+    def _on_buffer_slider(self, value):
+        self.buffer_base_s = value / 1000.0
+        self._refresh_buffer_label()
+
+    def _on_adaptive_toggled(self, checked):
+        self.adaptive_buffer = bool(checked)
+        if not checked:
+            self.buffer_extra_s = 0.0
+        self._refresh_buffer_label()
+
+    def _refresh_buffer_label(self):
+        base = int(round(self.buffer_base_s * 1000))
+        extra = int(round(self.buffer_extra_s * 1000))
+        self.bufferLabel.setText(f"Buffer: {base} ms" + (f" (+{extra})" if extra > 0 else ""))
+
+    def _compute_play_time(self, sender_ts_local):
+        """Υπολογίζει το play_time: βάση + επιπλέον buffer (leaky max).
+        Αν η νότα έρθει αργά, το επιπλέον buffer ανεβαίνει όσο χρειάζεται ώστε οι επόμενες
+        να προλαβαίνουν· όταν δεν υπάρχουν αργές νότες, χαλαρώνει με RELAX_MS_PER_S ms/s."""
+        now = time.perf_counter()
+        self._last_arrival = now            # για το experiment CSV (στιγμή άφιξης του μηνύματος)
+        dt = max(0.0, now - self._extra_last_ts)
+        self._extra_last_ts = now
+
+        if not self.adaptive_buffer or self.server_clock_offset == 0.0:
+            # χωρίς adaptive (ή χωρίς ολοκληρωμένο clock sync): μόνο η βάση
+            self._last_pre_delay_s = self.buffer_base_s
+            self._last_late = (sender_ts_local + self.buffer_base_s) < (now + 0.002)
+            return max(sender_ts_local + self.buffer_base_s, now + 0.002)
+
+        self.buffer_extra_s = max(0.0, self.buffer_extra_s - (RELAX_MS_PER_S / 1000.0) * dt)
+        play_time = sender_ts_local + self.buffer_base_s + self.buffer_extra_s
+        # buffer ΠΡΙΝ την ενδεχόμενη ανύψωση (για το slack_ms στο experiment CSV)
+        self._last_pre_delay_s = self.buffer_base_s + self.buffer_extra_s
+        self._last_late = play_time < now + 0.002
+
+        if play_time < now + 0.002:                       # ήρθε αργά
+            needed = (now + 0.002) - (sender_ts_local + self.buffer_base_s)
+            self.buffer_extra_s = min(MAX_EXTRA_MS / 1000.0, max(self.buffer_extra_s, needed))
+            play_time = max(sender_ts_local + self.buffer_base_s + self.buffer_extra_s, now + 0.002)
+        return play_time
+
+    def process_remote_midi_queue(self):
+        if not self.remote_midi_queue:
+            return
+
+        now = time.perf_counter()
+        # πέτα "δηλητηριασμένες" νότες (play_time πολύ μακριά = offset δεν είχε συγχρονιστεί)
+        while self.remote_midi_queue and (self.remote_midi_queue[0]["play_time"] - now) > 5.0:
+            dropped = self.remote_midi_queue.pop(0)
+            if dropped.get("_rec"):
+                dropped["_rec"]["status"] = "dropped_far_future"
+                self.exp.log_received(dropped["_rec"])
+        if not self.remote_midi_queue:
+            return
+
+        ready = []
+        while self.remote_midi_queue and self.remote_midi_queue[0]["play_time"] <= now:
+            ready.append(self.remote_midi_queue.pop(0))
+
+        for event in ready:
+            actual_play_ts = time.perf_counter()
+            user = event["user"]
+            stream = event["stream"]
+            msg_type = event["type"]
+            send_ms_val = None
+            try:
+                if "params" in event:
+                    msg = Message(msg_type, **event["params"])
+                else:
+                    msg = Message(msg_type, note=event["note"], velocity=event["velocity"])
+
+                route = self.main_app.routing_config.get((user, stream))
+                vmidi_name = None
+                forced = None          # None = κράτα το αρχικό κανάλι του αποστολέα
+                if route:
+                    vmidi_name = route.get("vmidi")
+                    forced = route.get("channel")
+                msg.channel = (int(forced) - 1) if forced else event.get("channel", 0)
+
+                if vmidi_name and getattr(self.main_app, "vmidi", None):
+                    b = msg.bytes()
+                    hex_bytes = " ".join(f"{x:02X}" for x in b)
+                    _t_send0 = time.perf_counter()
+                    r = self.main_app.vmidi.send_hex(vmidi_name, hex_bytes)
+                    send_ms_val = (time.perf_counter() - _t_send0) * 1000.0
+                    print(f"SEND→BRIDGE port={vmidi_name} hex={hex_bytes} result={r}")
+                else:
+                    print(
+                        f"NO SEND: vmidi_name={vmidi_name} vmidi_obj={getattr(self.main_app, 'vmidi', None) is not None}")
+
+            except Exception as e:
+                print("⚠️ Scheduled MIDI playback error:", e)
+
+            rec = event.get("_rec")
+            if rec is not None:
+                try:
+                    lateness_ms = (actual_play_ts - event["play_time"]) * 1000.0
+                    delay_ms = float(rec["delay_ms"])
+                    transit_ms = float(rec["transit_est_ms"])
+                    rec["played_s"] = f"{actual_play_ts:.6f}"
+                    rec["lateness_ms"] = f"{lateness_ms:.3f}"
+                    rec["send_ms"] = "" if send_ms_val is None else f"{send_ms_val:.3f}"
+                    rec["eff_delay_ms"] = f"{max(delay_ms, transit_ms + 2.0) + lateness_ms:.3f}"
+                    self.exp.log_received(rec)
+                except Exception as e:
+                    print("⚠️ experiment log error:", e)
+    def send_midi(self, note, velocity):
+        if not self.main_app.ws:
+            return
+        self.midi_seq += 1
+        midi_event = {
+            "user": self.main_app.username,
+            "stream": "gui",
+            "seq": self.midi_seq,
+            "timestamp": time.perf_counter() + self.server_clock_offset,
+            "note": note,
+            "velocity": velocity,
+            "type": "note_on" if velocity > 0 else "note_off",
+            "room": self.room_name,
+            "tcp_midi": True,
+        }
+        msg_type = "note_on" if velocity > 0 else "note_off"
+        self.exp.log_sent(self.midi_seq, "gui", msg_type, 0, note, velocity,
+                          midi_event["timestamp"] - self.server_clock_offset)
+        self.log_manager.log("MY_MIDI", f"{self.main_app.username}/gui: {msg_type} note={note} vel={velocity}")
+        self.dispatch_midi_event(midi_event)
+    def _drop_remote_stream(self, key):
+        app = self.main_app
+        route = app.routing_config.pop(key, None)
+        if route:
+            app.close_remote_port(route.get("vmidi"))
+        app.seen_streams.discard(key)
+        app.locked_routes.discard(key)
+        app.stream_pretty.pop(key, None)
+        app.stream_meta.pop(key, None)
+        app.stream_portname.pop(key, None)
+    def update_user_list(self, users, ips=None):
+        """Synchronize UI with the current list of connected users."""
+        self.connected_users = users
+        if self.main_app.ws:
+            self.send_streams_announce()
+        self.p2p_sync_peers(users)
+
+        # IP κάθε χρήστη: γράφεται στο log μία φορά, τη στιγμή που εμφανίζεται στο δωμάτιο
+        if ips:
+            self.user_ips.update(ips)
+            for username in users:
+                ip = ips.get(username)
+                if ip and username not in self._logged_ips:
+                    self._logged_ips.add(username)
+                    self.log_manager.log("ROOM", f"🌐 {username} connected from IP {ip}")
+                    lbl = self.user_name_labels.get(username)
+                    if lbl is not None:
+                        lbl.setToolTip(f"IP: {ip}")
+        for username in list(self._logged_ips):
+            if username not in users:
+                self._logged_ips.discard(username)
+                self.user_ips.pop(username, None)
+
+        # 1️⃣ Add any new users not yet in the UI
+        for username in users:
+            if username not in self.user_ui_elements:
+                self.add_user_ui(username)
+                QtCore.QTimer.singleShot(500, self.send_streams_announce)
+
+        # 2️⃣ Remove any users who have left
+        for username in list(self.user_ui_elements.keys()):
+            if username not in users:
+                container = self.user_ui_elements.pop(username)
+                self.user_name_labels.pop(username, None)
+                container.setParent(None)
+                container.deleteLater()
+                if hasattr(self, "log_manager"):
+                    self.log_manager.remove_peer(username)
+                # Also clean up velocity + latency bars
+                self.user_velocity_bars.pop(username, None)
+                getattr(self, "_vel_levels", {}).pop(username, None)
+                self.user_latency_labels.pop(username, None)
+                # κλείσε όλα τα ports που ανήκαν σε αυτόν τον χρήστη
+                for key in [k for k in list(self.main_app.routing_config) if k[0] == username]:
+                    self._drop_remote_stream(key)
+                # streams που είχε ανακοινώσει αλλά δεν είχαν ακόμα route
+                for key in [k for k in list(self.main_app.seen_streams) if k[0] == username]:
+                    self._drop_remote_stream(key)
+
+                if getattr(self.main_app, "routing_manager_dialog", None):
+                    self.main_app.routing_manager_dialog.refresh_table()
+
+        # 🧠 If only the room creator remains, reset WebRTC to accept new joiners
+        if self.is_creator and len(users) <= 1:
+            print("🔄 All peers left — resetting WebRTC state for future connections.")
+            if self.pc:
+                asyncio.ensure_future(self.pc.close())
+            self.pc = None
+            self.channel = None
+            self.offer_sent = False
+
+        self.log_manager.log("ROOM", f"👥 Updated user list: {users}")
+
+    def kick_user(self, target_user: str):
+        # only leader can kick
+        if getattr(self.main_app, "room_leader", None) != self.main_app.username:
+            return
+        if not self.main_app.ws:
+            return
+
+        # confirmation dialog
+        reply = QMessageBox.question(
+            self,
+            "Kick user",
+            f"Kick {target_user} from the room?",
+            QMessageBox.Yes | QMessageBox.No
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        asyncio.get_event_loop().create_task(
+            self.main_app.ws.send(json.dumps({
+                "type": "kick",
+                "room": self.room_name,
+                "target": target_user
+            }))
+        )
+
+    def add_user_ui(self, username):
+        if username in self.user_ui_elements:
+            return
+        if hasattr(self, "log_manager") and username != self.main_app.username:
+            self.log_manager.ensure_peer(username)
+            self.log_manager.log("ROOM", f"➕ User joined: {username}")
+        container = QtWidgets.QWidget()
+        outer = QtWidgets.QVBoxLayout(container)
+
+        # --- Row 1: name + buttons (horizontal) ---
+        top_row = QtWidgets.QHBoxLayout()
+
+        name_label = QtWidgets.QLabel(username)
+        top_row.addWidget(name_label)
+        self.user_name_labels[username] = name_label
+        if self.user_ips.get(username):
+            name_label.setToolTip(f"IP: {self.user_ips[username]}")
+        container.setMinimumWidth(240)   # ώστε οι χρήστες δίπλα-δίπλα να μην στριμώχνονται
+
+        top_row.addStretch(1)
+
+        # Assign leader button (only shown to current leader, and not for self)
+        assign_btn = QtWidgets.QPushButton("Assign Leader")
+        assign_btn.setFixedHeight(22)
+        assign_btn.setVisible(False)  # will be controlled by update_leader_ui()
+        assign_btn.clicked.connect(lambda _, u=username: self.assign_leader(u))
+        top_row.addWidget(assign_btn)
+        kick_btn = QtWidgets.QPushButton("Kick")
+        kick_btn.setFixedHeight(22)
+        kick_btn.setVisible(False)  # controlled by update_leader_ui()
+        kick_btn.clicked.connect(lambda _, u=username: self.kick_user(u))
+        top_row.addWidget(kick_btn)
+
+        outer.addLayout(top_row)
+
+        # --- Row 2: velocity bar ---
+        bar = QtWidgets.QProgressBar()
+        bar.setValue(0)
+        outer.addWidget(bar)
+
+        # --- Row 3: latency label ---
+        latency_label = QtWidgets.QLabel("Latency: -- ms")
+        latency_label.setStyleSheet("color: gray; font-size: 10px;")
+        if username == self.main_app.username:
+            latency_label.hide()
+        outer.addWidget(latency_label)
+
+        self.ui.uservelocityLayout.addWidget(container)
+
+        # Store
+        self.user_ui_elements[username] = container
+        self.user_velocity_bars[username] = bar
+        self.user_latency_labels[username] = latency_label
+
+        # Apply visibility rule now (in case leader already known)
+        self.update_leader_ui(getattr(self.main_app, "room_leader", None))
+
+    async def start_offer(self):
+        # WebRTC απενεργοποιημένο — όλα πάνε μέσω TCP.
+        return
+
+        # Ensure PeerConnection exists
+        if not self.pc:
+            print("🔧 Creating new RTCPeerConnection before sending offer.")
+            self.pc = RTCPeerConnection()
+
+        # Create DataChannel safely
+        if not self.channel:
+            self.channel = self.pc.createDataChannel(
+                "midi",
+                ordered=False,
+                maxRetransmits=0
+            )
+
+            @self.channel.on("open")
+            def on_open():
+                print(f"✅ DataChannel opened for {self.main_app.username}")
+                self.send_streams_announce()
+            self.channel.on("message", self.on_midi_message)
+
+        # Create SDP offer
+        print(f"🟢 {self.main_app.username} creating OFFER now (peer present)")
+        offer = await self.pc.createOffer()
+        await self.pc.setLocalDescription(offer)
+
+        # Send offer to the signaling server
+        await self.main_app.ws.send(json.dumps({
+            "type": "offer",
+            "room": self.room_name,
+            "sdp": self.pc.localDescription.sdp,
+            "sdpType": self.pc.localDescription.type
+        }))
+
+        self.offer_sent = True
+
+    def toggle_local_mute(self):
+        self.local_mute = not self.local_mute
+        if self.local_mute and hasattr(self, "piano"):
+            self.piano.clear_all()
+        state = "🔇 Muted" if self.local_mute else "🔊 Active"
+        self.ui.muteButton.setText(f"Mute Local ({state})")
+        print(f"[RoomWindow] Local mute set to {self.local_mute}")
+
+    def is_room_leader(self):
+        return getattr(self.main_app, "room_leader", None) == self.main_app.username
+
+    def start_metronome_clicked(self):
+        if not self.is_room_leader():
+            print("⚠️ Only room leader can start metronome")
+            return
+
+        bpm = self.ui.bpmSpinBox.value()
+        # start_time σε SERVER TIME reference (ίδιο με τα MIDI notes)
+        start_time = time.perf_counter() + self.server_clock_offset + 3.0
+
+        payload = {
+            "type": "metronome_start",
+            "bpm": bpm,
+            "start_time": start_time,
+            "leader": self.main_app.username
+        }
+
+        self.start_local_metronome(bpm, start_time)
+
+        self.send_to_room(payload)
+
+        print("▶️ Metronome start sent:", payload)
+
+    def stop_metronome_clicked(self):
+        if not self.is_room_leader():
+            print("⚠️ Only room leader can stop metronome")
+            return
+
+        self.stop_local_metronome()
+
+        payload = {
+            "type": "metronome_stop",
+            "leader": self.main_app.username
+        }
+
+        self.send_to_room(payload)
+
+        print("⏹️ Metronome stop sent")
+
+    def apply_bpm_clicked(self):
+        if not self.is_room_leader():
+            print("⚠️ Only room leader can change BPM")
+            return
+
+        bpm = self.ui.bpmSpinBox.value()
+        self.metronome_bpm = bpm
+
+        payload = {
+            "type": "metronome_bpm_update",
+            "bpm": bpm,
+            "leader": self.main_app.username
+        }
+
+        self.send_to_room(payload)
+
+        print("🎚️ BPM update sent:", bpm)
+
+    def start_local_metronome(self, bpm, start_time):
+        self.metronome_bpm = bpm
+        self.metronome_start_time = start_time
+        self.metronome_last_beat = -1
+        self.metronome_running = True
+
+    def stop_local_metronome(self):
+        self.metronome_running = False
+        self.metronome_start_time = None
+        self.metronome_last_beat = -1
+
+    def metronome_tick(self):
+        if not self.metronome_running or self.metronome_start_time is None:
+            return
+
+        # now σε SERVER TIME reference — ίδιο με το start_time
+        now = time.perf_counter() + self.server_clock_offset
+
+        if now < self.metronome_start_time:
+            return
+
+        beat_interval = 60.0 / self.metronome_bpm
+        elapsed = now - self.metronome_start_time
+        beat = int(elapsed / beat_interval)
+
+        if beat != self.metronome_last_beat:
+            self.metronome_last_beat = beat
+
+            beat_in_bar = beat % 4
+
+            if beat_in_bar == 0:
+                note = 76
+                velocity = 110
+                print("🔔 METRONOME strong beat")
+            else:
+                note = 72
+                velocity = 80
+                print("tick")
+
+            if getattr(self.main_app, "vmidi", None) and getattr(self, "metronome_port_name", None):
+                msg_on = Message("note_on", note=note, velocity=velocity, channel=9)
+                msg_off = Message("note_off", note=note, velocity=0, channel=9)
+
+                hex_on = " ".join(f"{x:02X}" for x in msg_on.bytes())
+                hex_off = " ".join(f"{x:02X}" for x in msg_off.bytes())
+
+                self.main_app.vmidi.send_hex_nowait(self.metronome_port_name, hex_on)
+
+                QtCore.QTimer.singleShot(
+                    60,
+                    lambda port=self.metronome_port_name, h=hex_off:
+                    self.main_app.vmidi.send_hex(port, h)
+                )
+
+    def start_recording(self):
+        self.recording = True
+        self.recorded_events = []
+        self.recording_start_time = time.time()
+
+        self.ui.StartButton.setEnabled(False)
+        self.ui.StopButton.setEnabled(True)
+
+        print("🔴 Recording started")
+
+    def stop_recording(self):
+        if not self.recording:
+            return
+
+        self.recording = False
+        self.ui.StartButton.setEnabled(True)
+        self.ui.StopButton.setEnabled(False)
+
+        if not self.recorded_events:
+            print("⚠️ No MIDI events recorded")
+            return
+
+        filename = f"midirooms_recording_{self.room_name}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.mid"
+
+        mid = mido.MidiFile()
+        track = mido.MidiTrack()
+        mid.tracks.append(track)
+
+        ticks_per_beat = mid.ticks_per_beat
+        tempo = mido.bpm2tempo(getattr(self, "metronome_bpm", 120))
+
+        track.append(mido.MetaMessage("set_tempo", tempo=tempo, time=0))
+
+        last_time = 0.0
+
+        for event in self.recorded_events:
+            delta_seconds = event["time"] - last_time
+            last_time = event["time"]
+
+            delta_ticks = int(mido.second2tick(delta_seconds, ticks_per_beat, tempo))
+
+            if event.get("extra") is not None:
+                msg = Message(event["type"], channel=event.get("channel", 0),
+                              time=max(0, delta_ticks), **event["extra"])
+            else:
+                msg = Message(
+                    event["type"],
+                    note=event["note"],
+                    velocity=event["velocity"],
+                    channel=event.get("channel", 0),
+                    time=max(0, delta_ticks)
+                )
+
+            track.append(msg)
+
+        mid.save(filename)
+
+        print(f"💾 Recording saved: {filename}")
+        QtWidgets.QMessageBox.information(
+            self,
+            "Recording Saved",
+            f"Recording saved locally as:\n{filename}"
+        )
+
+    def record_midi_event(self, user, stream, msg_type, note=None, velocity=None, channel=0, extra=None):
+        if not getattr(self, "recording", False):
+            return
+
+        # Do not record metronome notes
+        if stream == "metronome" or user == "metronome":
+            return
+
+        if extra is None and (note is None or velocity is None):
+            return
+
+        now = time.time()
+        relative_time = now - self.recording_start_time
+
+        self.recorded_events.append({
+            "time": relative_time,
+            "user": user,
+            "stream": stream,
+            "type": msg_type,
+            "note": note,
+            "velocity": velocity,
+            "channel": channel,
+            "extra": extra
+        })
+
+class RoutingManager(QDialog):
+    def __init__(self, main_app):
+        super().__init__()
+        self.main_app = main_app
+        self.room_window = getattr(main_app, "room_window", None)
+        self.ui = Ui_routingDialog()
+        self.ui.setupUi(self)
+        self.setWindowTitle("MIDI Port Manager")
+        self.resize(1000, 600)
+        self.setMinimumSize(900, 500)
+        self.pending = set(getattr(main_app, "selected_inputs", []) or [])  # αλλαγές σε αναμονή
+
+        # ── Table ──
+        table = self.ui.routingTable
+        table.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding,
+            QtWidgets.QSizePolicy.Expanding
+        )
+        table.verticalHeader().setDefaultSectionSize(32)
+        table.verticalHeader().hide()
+
+        table.setColumnCount(4)
+        table.setHorizontalHeaderLabels(
+            ["Type", "User / Device", "Stream / Port", "Active"]
+        )
+        header = table.horizontalHeader()
+        header.setSectionResizeMode(0, QtWidgets.QHeaderView.ResizeToContents)  # Type
+        header.setSectionResizeMode(1, QtWidgets.QHeaderView.Stretch)  # User/Device (όνομα πόρτας)
+        header.setSectionResizeMode(2, QtWidgets.QHeaderView.Stretch)  # Stream/Port
+        header.setSectionResizeMode(3, QtWidgets.QHeaderView.ResizeToContents)  # Active
+
+        table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        self._sel_syncing = False
+        table.itemSelectionChanged.connect(self._on_selection_changed)
+
+        # κουμπιά για τα loopback endpoints (αριστερά, πριν το spacer)
+        self.createLbButton = QtWidgets.QPushButton("Create Endpoint Pair")
+        self.deleteLbButton = QtWidgets.QPushButton("Delete Endpoint Pair")
+        self.deleteLbButton.setEnabled(False)
+        self.deleteLbButton.setToolTip("Select a 🔁 Loopback row to delete the endpoint pair")
+        self.ui.horizontalLayout.insertWidget(0, self.createLbButton)
+        self.ui.horizontalLayout.insertWidget(1, self.deleteLbButton)
+        self.createLbButton.clicked.connect(self.create_loopback)
+        self.deleteLbButton.clicked.connect(self.delete_loopback)
+
+        self.ui.okButton.clicked.connect(self.apply_changes)
+        self.ui.refreshButton.clicked.connect(self.on_refresh)
+        self.ui.cancelButton.clicked.connect(self.reject)
+
+        self.refresh_table()
+
+    def get_midi_outputs(self):
+        """Detect available MIDI output ports."""
+        try:
+            return mido.get_output_names()
+        except Exception as e:
+            print("⚠️ Could not get MIDI outputs:", e)
+            return []
+
+    def refresh_table(self):
+        self.room_window = getattr(self.main_app, "room_window", None)
+        table = self.ui.routingTable
+        table.setRowCount(0)  # καθάρισε πρώτα
+
+        me = self.main_app.username
+
+        # ── ΤΜΗΜΑ Α: Δικές μου συσκευές ──────────────────────────────
+        try:
+            all_inputs = mido.get_input_names()
+        except Exception:
+            all_inputs = []
+
+        vmidi_ports_lower = {v.lower() for v in getattr(self.main_app, "created_vmidi_ports", set())}
+        metronome_name = (getattr(
+            getattr(self.main_app, "room_window", None), "metronome_port_name", ""
+        ) or "").lower()
+
+        def is_vmidi_or_metronome(name: str) -> bool:
+            if is_internal_port(name):
+                return True
+            n = name.lower()
+            # exact match με created ports
+            if n in vmidi_ports_lower:
+                return True
+            # partial match — το Windows προσθέτει " 0" ή παρόμοιο suffix
+            for vp in vmidi_ports_lower:
+                if n.startswith(vp) or vp.startswith(n):
+                    return True
+            # metronome με οποιοδήποτε suffix
+            if metronome_name and (n.startswith(metronome_name) or metronome_name.startswith(n)):
+                return True
+            return False
+
+        physical_inputs = [n for n in all_inputs if not is_vmidi_or_metronome(n)]
+
+        selected = set(self.pending)
+        selected_bases = {base_name(x) for x in selected}
+
+        loopbacks = list(getattr(self.main_app, "user_loopbacks", []))
+
+        for disp_name, dev_name in device_choices(physical_inputs):
+            role = loopback_role(dev_name, loopbacks)      # και οι δύο πλευρές (A)/(B) εμφανίζονται ξεχωριστά
+            lb_name = role[1] if role else None
+
+            row = table.rowCount()
+            table.insertRow(row)
+
+            # Col 0: Type
+            item_type = QtWidgets.QTableWidgetItem("🔁 Loopback" if lb_name else "🎹 Local")
+            item_type.setFlags(item_type.flags() & ~QtCore.Qt.ItemIsEditable)
+            table.setItem(row, 0, item_type)
+
+            # Col 1: Device name
+            item_dev = QtWidgets.QTableWidgetItem(disp_name)
+            item_dev.setData(QtCore.Qt.UserRole, dev_name)
+            item_dev.setData(QtCore.Qt.UserRole + 1, lb_name)     # μη-κενό μόνο για loopback του χρήστη
+            if lb_name:
+                other = lb_name + (LB_RECV_SUFFIX if role[0] == "send" else LB_SEND_SUFFIX)
+                item_dev.setToolTip(f"Endpoint pair '{lb_name}'. If MIDIRooms reads this side, "
+                                    f"send MIDI from your DAW/app to the OUTPUT port '{other}'.")
+            item_dev.setFlags(item_dev.flags() & ~QtCore.Qt.ItemIsEditable)
+            table.setItem(row, 1, item_dev)
+
+            # Col 2: Stream / Port — ίδια λογική με τους remote ("User — Device")
+            stream_id = ""
+            if self.room_window:
+                for sid, dname in self.room_window.stream_devices.items():
+                    if dname == dev_name:
+                        stream_id = sid
+                        break
+            item_stream = QtWidgets.QTableWidgetItem(f"{me} — {disp_name}")
+            item_stream.setFlags(item_stream.flags() & ~QtCore.Qt.ItemIsEditable)
+            if stream_id:
+                item_stream.setToolTip(f"stream id: {stream_id}")
+            table.setItem(row, 2, item_stream)
+
+            # Col 3: Active checkbox
+            chk = QtWidgets.QCheckBox()
+            chk.blockSignals(True)  # μην πυροδοτείς signal κατά το setChecked
+            chk.setChecked(dev_name in selected or base_name(dev_name) in selected_bases)
+            chk.blockSignals(False)  # ξαναενεργοποίησε τα signals
+            chk.stateChanged.connect(lambda state, d=dev_name: self.toggle_local_device(d, state))
+            cell_widget = QtWidgets.QWidget()
+            layout = QtWidgets.QHBoxLayout(cell_widget)
+            layout.addWidget(chk)
+            layout.setAlignment(QtCore.Qt.AlignCenter)
+            layout.setContentsMargins(0, 0, 0, 0)
+            table.setCellWidget(row, 3, cell_widget)
+
+        # ── ΤΜΗΜΑ Β: Remote peers ──────────────────────────────────────
+        seen = set(getattr(self.main_app, "seen_streams", set()))
+        announced = set(getattr(self.main_app, "stream_pretty", {}).keys())
+        routed = set(getattr(self.main_app, "routing_config", {}).keys())
+        remote_streams = sorted((seen | announced | routed))
+        remote_streams = [(u, s) for (u, s) in remote_streams if u != me]
+
+        locked = getattr(self.main_app, "locked_routes", set())
+        routing = getattr(self.main_app, "routing_config", {})
+        pretty_map = getattr(self.main_app, "stream_pretty", {})
+
+        for (user, stream) in remote_streams:
+            key = (user, stream)
+            row = table.rowCount()
+            table.insertRow(row)
+
+            # Col 0: Type
+            item_type = QtWidgets.QTableWidgetItem("🌐 Remote")
+            item_type.setFlags(item_type.flags() & ~QtCore.Qt.ItemIsEditable)
+            table.setItem(row, 0, item_type)
+
+            # Col 1: User / Device — το όνομα της πόρτας στην οποία λαμβάνω, όπως φαίνεται στο σύστημά μου
+            route = routing.get(key, {})
+            assigned = route.get("vmidi", "")
+            port_text = assigned if assigned else "(allocating...)"
+            item_user = QtWidgets.QTableWidgetItem(port_text)
+            item_user.setFlags(item_user.flags() & ~QtCore.Qt.ItemIsEditable)
+            item_user.setToolTip(f"Remote user: {user}")
+            table.setItem(row, 1, item_user)
+
+            # Col 2: Stream pretty name
+            pretty = pretty_map.get(key, stream)
+            item_stream = QtWidgets.QTableWidgetItem(pretty)
+            item_stream.setFlags(item_stream.flags() & ~QtCore.Qt.ItemIsEditable)
+            item_stream.setData(QtCore.Qt.UserRole, stream)
+            if key in locked:
+                item_stream.setToolTip("🔒 Auto-allocated")
+            table.setItem(row, 2, item_stream)
+
+            # Col 3: Active — πάντα ✓ για remote (δεν μπορείς να τα κλείσεις χειροκίνητα)
+            item_active = QtWidgets.QTableWidgetItem("✓")
+            item_active.setFlags(item_active.flags() & ~QtCore.Qt.ItemIsEditable)
+            item_active.setTextAlignment(QtCore.Qt.AlignCenter)
+            table.setItem(row, 3, item_active)
+
+        self._update_delete_button()
+
+    def _selected_loopback(self):
+        """Το όνομα του επιλεγμένου loopback του χρήστη, ή None."""
+        table = self.ui.routingTable
+        for idx in table.selectionModel().selectedRows():
+            item = table.item(idx.row(), 1)
+            lb = item.data(QtCore.Qt.UserRole + 1) if item else None
+            if lb:
+                return lb
+        return None
+
+    def _on_selection_changed(self):
+        """Όταν επιλέγεται η μία πλευρά ενός ζεύγους, επιλέγεται και η άλλη (ώστε το Delete να τα διαγράφει μαζί)."""
+        if self._sel_syncing:
+            return
+        table = self.ui.routingTable
+        sm = table.selectionModel()
+        selected = {i.row() for i in sm.selectedRows()}
+        names = set()
+        for r in selected:
+            it = table.item(r, 1)
+            lb = it.data(QtCore.Qt.UserRole + 1) if it else None
+            if lb:
+                names.add(lb)
+        if names:
+            self._sel_syncing = True
+            try:
+                for r in range(table.rowCount()):
+                    it = table.item(r, 1)
+                    if it and it.data(QtCore.Qt.UserRole + 1) in names and r not in selected:
+                        sm.select(table.model().index(r, 0),
+                                  QtCore.QItemSelectionModel.Select | QtCore.QItemSelectionModel.Rows)
+            finally:
+                self._sel_syncing = False
+        self._update_delete_button()
+
+    def _update_delete_button(self):
+        self.deleteLbButton.setEnabled(bool(self._selected_loopback()))
+
+    def create_loopback(self):
+        dlg = CreateLoopbackDialog(self.main_app, self)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        name = dlg.created_name
+        self.refresh_table()
+        QtCore.QTimer.singleShot(800, self.refresh_table)      # το WinMM χρειάζεται λίγο να το δει
+
+    def delete_loopback(self):
+        name = self._selected_loopback()
+        if not name:
+            return
+        if QMessageBox.question(
+                self, "Delete Endpoint Pair",
+                f"Delete the endpoint pair '{name}'?\nIt is removed from the room and from Windows.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No) != QMessageBox.Yes:
+            return
+
+        mine = [name]
+        used = [d for d in list(self.pending) + list(getattr(self.main_app, "selected_inputs", []) or [])
+                if loopback_role(d, mine)]
+        self.pending = {x for x in self.pending if not loopback_role(x, mine)}
+        self.main_app.selected_inputs = [x for x in (getattr(self.main_app, "selected_inputs", []) or [])
+                                         if not loopback_role(x, mine)]
+        room_win = getattr(self.main_app, "room_window", None)
+        if room_win:
+            for d in used:
+                self._close_device(room_win, d)
+            room_win.send_streams_announce()
+        for k in [k for k in list(_open_inputs) if loopback_role(k, mine)]:
+            safe_close_port(_open_inputs.get(k), k)       # κλείνει και το cache αν έμεινε ανοιχτό
+
+        self.main_app.delete_user_loopback(name)
+        QtCore.QTimer.singleShot(300, self.refresh_table)
+        self.refresh_table()
+
+    def toggle_local_device(self, dev_name: str, state: int):
+        """Καταγράφει μόνο την επιλογή. Εφαρμόζεται όταν πατηθεί OK."""
+        self.pending = {x for x in self.pending if base_name(x) != base_name(dev_name)}
+        if state == QtCore.Qt.Checked:
+            self.pending.add(dev_name)
+
+    def _close_device(self, room_win, dev_name):
+        to_remove = []
+        for sid, port in list(room_win.midi_inputs):
+            if base_name(room_win.stream_devices.get(sid, "")) == base_name(dev_name):
+                safe_close_port(port, sid)
+                to_remove.append(sid)
+        room_win.midi_inputs = [(s, p) for s, p in room_win.midi_inputs if s not in to_remove]
+        for sid in to_remove:
+            room_win.stream_devices.pop(sid, None)
+            room_win.failed_inputs.discard(dev_name.lower())
+        print(f"🔌 Έκλεισε MIDI input: {dev_name}")
+
+    def apply_changes(self):
+        old = list(getattr(self.main_app, "selected_inputs", []) or [])
+        new = list(self.pending)
+        old_bases = {base_name(x) for x in old}
+        new_bases = {base_name(x) for x in new}
+
+        enabled = [d for d in new if base_name(d) not in old_bases]
+        disabled = [d for d in old if base_name(d) not in new_bases]
+
+        self.main_app.selected_inputs = new  # πρώτα η λίστα, γιατί το try_reopen_device την ελέγχει
+        room_win = getattr(self.main_app, "room_window", None)
+
+        if room_win:
+            for d in disabled:
+                self._close_device(room_win, d)
+            if disabled:
+                room_win.send_streams_announce()
+            for d in enabled:
+                QtCore.QTimer.singleShot(500, lambda d=d: room_win.try_reopen_device(d))
+
+        self.accept()
+
+    def on_refresh(self):
+        force_winmm_refresh()  # ώστε το WinMM να ξαναδεί τις συσκευές
+        self.main_app.refresh_midi_state()
+        self.refresh_table()
+
+
+class CreateLoopbackDialog(QtWidgets.QDialog):
+    """Ζητά όνομα και δημιουργεί loopback endpoint (OK / Cancel)."""
+    def __init__(self, main_app, parent=None):
+        super().__init__(parent)
+        self.main_app = main_app
+        self.created_name = None
+        self.setWindowTitle("Create Endpoint Pair")
+        self.setMinimumWidth(380)
+        lay = QtWidgets.QVBoxLayout(self)
+        lay.addWidget(QtWidgets.QLabel("Name of the new endpoint pair:"))
+        self.edit = QtWidgets.QLineEdit()
+        self.edit.setMaxLength(LB_NAME_MAX)
+        self.edit.setPlaceholderText("e.g. Jam Pad")
+        lay.addWidget(self.edit)
+        hint = QtWidgets.QLabel(f"English letters, digits, space, _ and - (max {LB_NAME_MAX} characters)")
+        hint.setStyleSheet("color: gray;")
+        lay.addWidget(hint)
+        btns = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel)
+        btns.accepted.connect(self._on_ok)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+        self.edit.setFocus()
+
+    def _on_ok(self):
+        ok, result = self.main_app.create_user_loopback(self.edit.text())
+        if not ok:
+            QMessageBox.warning(self, "Create Endpoint Pair", result)
+            return                       # μένει ανοιχτό για διόρθωση
+        self.created_name = result
+        self.accept()
+
+
+class LogSettingsDialog(QtWidgets.QDialog):
+    """Παράθυρο με τικ για έλεγχο του τι εμφανίζεται πού."""
+    peers_changed = QtCore.pyqtSignal()
+    def __init__(self, room_window):
+        super().__init__()
+        self.room_window = room_window
+        self.lm = room_window.log_manager
+        self.setWindowTitle("Log Settings")
+        self.resize(600, 500)
+
+        # αντίγραφο των ρυθμίσεων: γράφεται στο LogManager μόνο με Apply / OK
+        self.pending = {}
+        for cat in self.lm.CATEGORIES:
+            self.pending[("cat", cat)] = dict(self.lm.routing[cat])
+        for peer, route in self.lm.peer_routing.items():
+            self.pending[("peer", peer)] = dict(route)
+
+        layout = QtWidgets.QVBoxLayout(self)
+
+        # Πίνακας: γραμμές = κατηγορίες, στήλες = cmd/room/file
+        self.table = QtWidgets.QTableWidget()
+        self.table.setColumnCount(4)
+        self.table.setHorizontalHeaderLabels(["Category", "CMD", "Room Log", "Save to File"])
+        self.table.horizontalHeader().setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+        layout.addWidget(self.table)
+
+        # File controls
+        file_row = QtWidgets.QHBoxLayout()
+        self.file_btn = QtWidgets.QPushButton("Stop Saving" if self.lm.file_enabled else "Start Saving to CSV...")
+        self.file_btn.clicked.connect(self.toggle_file)
+        file_row.addWidget(self.file_btn)
+        import os as _os
+        self.file_label = QtWidgets.QLabel(_os.path.basename(self.lm.file_path) if (self.lm.file_enabled and self.lm.file_path) else "(no file)")
+        file_row.addWidget(self.file_label)
+        layout.addLayout(file_row)
+
+        # Κουμπιά κάτω δεξιά
+        btn_row = QtWidgets.QHBoxLayout()
+        btn_row.addStretch(1)
+        ok_btn = QtWidgets.QPushButton("OK")
+        apply_btn = QtWidgets.QPushButton("Apply")
+        cancel_btn = QtWidgets.QPushButton("Cancel")
+        ok_btn.clicked.connect(self.accept_changes)
+        apply_btn.clicked.connect(self.apply_changes)
+        cancel_btn.clicked.connect(self.reject)
+        for b in (ok_btn, apply_btn, cancel_btn):
+            btn_row.addWidget(b)
+        layout.addLayout(btn_row)
+        # δυναμική ενημέρωση όταν μπαίνουν/φεύγουν χρήστες
+        self.peers_changed.connect(self.sync_peers)
+        self.lm.peer_listener = self.peers_changed.emit
+        self.finished.connect(self._detach_listener)
+        self.refresh_table()
+
+    def refresh_table(self):
+        self.table.setRowCount(0)
+
+        for (kind, name), route in self.pending.items():
+            label = name if kind == "cat" else f"PEER: {name}"
+
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+
+            item = QtWidgets.QTableWidgetItem(label)
+            item.setFlags(item.flags() & ~QtCore.Qt.ItemIsEditable)
+            self.table.setItem(row, 0, item)
+
+            for col, dest in enumerate(["cmd", "room", "file"], start=1):
+                chk = QtWidgets.QCheckBox()
+                chk.setChecked(route.get(dest, False))
+                chk.stateChanged.connect(
+                    lambda state, r=route, d=dest: r.update({d: state == QtCore.Qt.Checked})
+                )
+                cell = QtWidgets.QWidget()
+                l = QtWidgets.QHBoxLayout(cell)
+                l.addWidget(chk)
+                l.setAlignment(QtCore.Qt.AlignCenter)
+                l.setContentsMargins(0, 0, 0, 0)
+                self.table.setCellWidget(row, col, cell)
+
+    def apply_changes(self):
+        """Γράφει τις ρυθμίσεις στο LogManager και μένει στο παράθυρο."""
+        for (kind, name), route in self.pending.items():
+            target = self.lm.routing.get(name) if kind == "cat" else self.lm.peer_routing.get(name)
+            if target is not None:
+                target.update(route)
+
+    def accept_changes(self):
+        self.apply_changes()
+        self.accept()
+
+    def toggle_file(self):
+        if self.lm.file_enabled:
+            self.lm.stop_file()
+            self.file_btn.setText("Start Saving to CSV...")
+            self.file_label.setText("(no file)")
+        else:
+            fname, _ = QtWidgets.QFileDialog.getSaveFileName(
+                self, "Save log as CSV",
+                f"midirooms_log_{_dt.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                "CSV Files (*.csv)"
+            )
+            if fname:
+                self.lm.start_file(fname)
+                self.file_btn.setText("Stop Saving")
+                self.file_label.setText(fname.split("/")[-1])
+
+    def sync_peers(self):
+        """Προσθέτει/αφαιρεί γραμμές peers χωρίς να χαθούν οι μη εφαρμοσμένες αλλαγές."""
+        for peer, route in self.lm.peer_routing.items():
+            if ("peer", peer) not in self.pending:
+                self.pending[("peer", peer)] = dict(route)
+        for key in [k for k in self.pending if k[0] == "peer" and k[1] not in self.lm.peer_routing]:
+            del self.pending[key]
+        self.refresh_table()
+
+    def _detach_listener(self, *_):
+        self.lm.peer_listener = None
+
+class RoomSettingsWindow(QMainWindow):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.ui = Ui_roomSettingsWindow()
+        self.ui.setupUi(self)
+        self.setWindowTitle("Create Room")
+
+        self.ui.cancelButton.clicked.connect(self.close)
+        self.ui.createRoomButton.clicked.connect(self.accept_settings)
+
+
+    def accept_settings(self):
+        room_name = self.ui.roomNameLineEdit.text().strip()
+        max_participants = self.ui.maxParticipantsSpinBox.value()
+        recording_enabled = self.ui.recordingCheckBox.isChecked()
+
+        if not room_name:
+            QMessageBox.warning(self, "Error", "Please enter a room name")
+            return
+        if not self.parent().username:
+            QMessageBox.warning(self, "No Username", "Username not initialized.")
+            return
+
+        if self.parent():
+            self.parent().ensure_vmidi_bridge()
+            self.parent().selected_room = room_name
+            self.parent().max_participants = max_participants
+            self.parent().recording_enabled = recording_enabled
+            self.parent().hide()
+            self.parent().room_window = RoomWindow(self.parent(), room_name=room_name, is_creator=True)
+            self.parent().room_window.show()
+            self.parent().room_window.add_user_ui(self.parent().username)
+            asyncio.get_event_loop().create_task(self.parent().room_window.start_webrtc())
+
+        self.close()
+
+class MidiUserApp(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        import os
+        import re
+        self.ui = Ui_MainWindow()
+        self.ui.setupUi(self)
+        # ξεκλείδωμα μεγέθους — επιτρέπει resize και maximize
+        self.setMinimumSize(800, 600)
+        self.setMaximumSize(16777215, 16777215)
+        self._build_responsive_layout()
+        self.username = ""
+        # Hide old username input widgets from the main window
+        self.ui.usernamelabel.hide()
+        self.ui.usernamelineEdit.hide()
+
+        self.username_display = QtWidgets.QLabel(self)
+        self.username_display.setObjectName("username_display")
+        self.username_display.setGeometry(QtCore.QRect(860, 32, 220, 24))
+        self.username_display.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+        self.username_display.setStyleSheet("font-weight: bold;")
+        self.username_display.setText("User: -")
+        self.selected_room = "lobby"
+        self.selected_inputs = []
+        self.ui.joinRoomButton.clicked.connect(lambda: asyncio.create_task(self.connect_to_room()))
+        self.ui.serverListWidget.itemDoubleClicked.connect(lambda item: asyncio.create_task(self.connect_to_room()))
+        self.ui.createRoomButton.clicked.connect(self.open_room_settings)
+        self.ui.actionMIDIsettings.triggered.connect(self.open_settings_window)
+        asyncio.get_event_loop().create_task(self.listen_for_rooms())
+        self.ws = None
+        self.room_window = None
+        self.room_leader = None
+        # ---- MIDIrooms auto-routing state ----
+        self.remote_port_pool = [f"MIDIrooms_Remote_{i}" for i in range(1, 65)]
+        # ---- virtualMIDI bridge ----
+        self.vmidi = None
+        self.created_vmidi_ports = set()  # all ports created via bridge (local + remote)
+        self.user_loopbacks = []          # loopback endpoints που δημιούργησε ο χρήστης (μόνο τα ονόματα)
+        self.vmidi_pool = []              # τα remote slots (ports) που δημιουργήθηκαν στην εκκίνηση
+        self.metronome_port_name = None
+        self.pid = os.getpid()
+        self.routing_config = getattr(self, "routing_config", {})
+        self.locked_routes = getattr(self, "locked_routes", set())
+        self.seen_streams = getattr(self, "seen_streams", set())
+        self.stream_meta = getattr(self, "stream_meta", {})
+        self.stream_pretty = getattr(self, "stream_pretty", {})
+        self.stream_portname = getattr(self, "stream_portname", {})
+        self.sticky_slots = {}            # (χρήστης, stream) -> όνομα slot που πήρε την τελευταία φορά
+        self.ensure_vmidi_bridge()
+        self.instance_suffix = f"{os.getpid() % 100:02d}"
+
+    def _build_responsive_layout(self):
+        """Τυλίγει τα widgets του main window σε responsive layout."""
+        cw = self.ui.centralwidget
+
+        main_layout = QtWidgets.QVBoxLayout()
+        main_layout.setContentsMargins(20, 30, 20, 20)
+        main_layout.setSpacing(15)
+
+        # App name (κεντραρισμένο)
+        self.ui.appnamelabel.setAlignment(QtCore.Qt.AlignCenter)
+        main_layout.addWidget(self.ui.appnamelabel, alignment=QtCore.Qt.AlignCenter)
+
+        main_layout.addSpacing(30)
+
+        # Servers label (κεντραρισμένο)
+        self.ui.serverslabel.setAlignment(QtCore.Qt.AlignCenter)
+        main_layout.addWidget(self.ui.serverslabel, alignment=QtCore.Qt.AlignCenter)
+
+        # Server list (μεγαλώνει, κεντραρισμένη με max width)
+        self.ui.serverListWidget.setSizePolicy(
+            QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Expanding
+        )
+        self.ui.serverListWidget.setMaximumWidth(900)
+        list_row = QtWidgets.QHBoxLayout()
+        list_row.addStretch(1)
+        list_row.addWidget(self.ui.serverListWidget, stretch=3)
+        list_row.addStretch(1)
+        main_layout.addLayout(list_row, stretch=1)
+
+        main_layout.addSpacing(20)
+
+        # Buttons (Create Room / Connect, κεντραρισμένα)
+        main_layout.addWidget(self.ui.layoutWidget, alignment=QtCore.Qt.AlignCenter)
+        cw.setLayout(main_layout)
+    def debug_dump_midi_ports(self, label=""):
+        try:
+            ins = mido.get_input_names()
+        except Exception as e:
+            ins = [f"<error reading inputs: {e}>"]
+
+        try:
+            outs = mido.get_output_names()
+        except Exception as e:
+            outs = [f"<error reading outputs: {e}>"]
+
+        print(f"\n===== MIDI PORT SNAPSHOT {label} =====")
+        print("CREATED BY APP:")
+        for x in sorted(getattr(self, "created_vmidi_ports", set())):
+            print("  APP:", x)
+
+        print("INPUTS:")
+        for x in ins:
+            print("  IN :", x)
+
+        print("OUTPUTS:")
+        for x in outs:
+            print("  OUT:", x)
+
+        print("=====================================\n")
+
+    def _create_port_fallback(self, name: str, settle: float = 0.3):
+        """Δημιουργεί port· αν το όνομα υπάρχει ήδη στο σύστημα (π.χ. ανενεργό port από προηγούμενο run
+        που το κρατά ακόμα ένα DAW), δοκιμάζει ένα εναλλακτικό όνομα. Επιστρέφει το όνομα ή None."""
+        suf = self._suffix()
+        for cand in (name, f"{name[:27]}_{suf}"[:31], f"{name[:25]}_{suf}x"[:31]):
+            if self.vmidi.create(cand, settle=settle):
+                return cand
+        return None
+
+    def init_vmidi_pool(self):
+        """
+        Δημιουργεί ΟΛΑ τα virtual ports ΜΙΑ φορά, στην εκκίνηση της εφαρμογής, ΠΡΙΝ ανοίξει
+        οποιαδήποτε MIDI είσοδος και πριν ανοίξει DAW.
+        Λόγος: στα Windows MIDI Services, ports του teVirtualMIDI που δημιουργούνται ενώ υπάρχει ήδη
+        ανοιχτή σύνδεση στο endpoint (π.χ. μια loopMIDI είσοδος ή ένα DAW) ΔΕΝ είναι ορατά σε αυτές
+        τις συνδέσεις και δεν παραδίδουν MIDI.
+        """
+        if getattr(self, "_pool_ready", False):
+            return
+        self.ensure_vmidi_bridge()
+        if not getattr(self, "vmidi", None):
+            print("❌ vmidi bridge not running; cannot create the port pool.")
+            return
+
+        print("🔧 Creating virtual MIDI ports (once, at startup)...")
+        met = self._create_port_fallback(METRONOME_PORT_NAME)
+        if met:
+            self.metronome_port_name = met
+            self.created_vmidi_ports.add(met)
+            print(f"✅ Metronome port: {met}")
+        else:
+            print("❌ Could not create the metronome port")
+
+        for i in range(1, VMIDI_POOL_SIZE + 1):
+            name = self._create_port_fallback(f"{PORT_PREFIX}{i:04d}")
+            if name:
+                self.vmidi_pool.append(name)
+                self.created_vmidi_ports.add(name)
+            else:
+                print(f"❌ Could not create pool port #{i}")
+
+        for lb in self._load_user_loopbacks():
+            if lb not in self.user_loopbacks and "sfx" in self.vmidi.create_pair(lb, LB_SEND_SUFFIX, LB_RECV_SUFFIX, settle=0.2):
+                self.user_loopbacks.append(lb)
+                print(f"✅ User loopback restored: {lb}")
+            else:
+                print(f"❌ Could not restore user loopback: {lb}")
+
+        self._pool_ready = True
+        self._load_sticky()
+        print(f"✅ vmidi pool ready: {self.vmidi_pool}")
+
+    # ---- Loopback endpoints του χρήστη ------------------------------------------------------
+    def _user_loopbacks_path(self):
+        import os
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), USER_LOOPBACKS_FILE)
+
+    def _load_user_loopbacks(self):
+        try:
+            with open(self._user_loopbacks_path(), "r", encoding="utf-8") as f:
+                names = json.load(f)
+            return [n for n in names if isinstance(n, str) and n]
+        except FileNotFoundError:
+            return []
+        except Exception as e:
+            print("⚠️ user loopbacks load failed:", e)
+            return []
+
+    def _save_user_loopbacks(self):
+        try:
+            with open(self._user_loopbacks_path(), "w", encoding="utf-8") as f:
+                json.dump(self.user_loopbacks, f, ensure_ascii=False)
+        except Exception as e:
+            print("⚠️ user loopbacks save failed:", e)
+
+    def validate_loopback_name(self, raw):
+        """Επιστρέφει (καθαρό_όνομα, None) ή (None, μήνυμα_σφάλματος)."""
+        name = re.sub(r"\s+", " ", (raw or "").strip())
+        if not name:
+            return None, "Please enter a name."
+        if len(name) > LB_NAME_MAX:
+            return None, f"The name is too long (max {LB_NAME_MAX} characters)."
+        if not re.fullmatch(r"[A-Za-z0-9 _\-]+", name):
+            return None, "Use only English letters, digits, spaces, '_' and '-'."
+        if name.upper().startswith(PORT_PREFIX):
+            return None, f"Names starting with {PORT_PREFIX} are reserved."
+        low = name.lower()
+        taken = {x.lower() for x in self.user_loopbacks} | {x.lower() for x in self.created_vmidi_ports}
+        try:
+            taken |= {display_name(n).lower() for n in mido.get_input_names()}
+        except Exception:
+            pass
+        if low in taken:
+            return None, "This name is already in use."
+        return name, None
+
+    def create_user_loopback(self, raw):
+        """Δημιουργεί loopback endpoint. Επιστρέφει (True, όνομα) ή (False, μήνυμα)."""
+        name, err = self.validate_loopback_name(raw)
+        if err:
+            return False, err
+        self.ensure_vmidi_bridge()
+        if not getattr(self, "vmidi", None):
+            return False, "The MIDI helper is not running."
+        resp = self.vmidi.create_pair(name, LB_SEND_SUFFIX, LB_RECV_SUFFIX, settle=0.5)
+        if not resp.startswith("OK"):
+            return False, "Windows MIDI Services could not create the endpoint pair (see the log of the helper)."
+        if resp.startswith("OK exists"):
+            return False, "This name is already in use."
+        if "sfx" not in resp:
+            self.vmidi.close(name)          # ο παλιός helper έφτιαξε ζεύγος (MR)/(DAW): το αφαιρούμε
+            return False, "The wms helper is outdated. Rebuild it (dotnet publish) and copy it to the wms folder."
+        self.user_loopbacks.append(name)
+        self._save_user_loopbacks()
+        print(f"✅ User loopback created: {name}")
+        return True, name
+
+    def delete_user_loopback(self, name):
+        if name not in self.user_loopbacks:
+            return False
+        ok = True
+        if getattr(self, "vmidi", None):
+            ok = self.vmidi.close(name)
+        self.user_loopbacks.remove(name)
+        self._save_user_loopbacks()
+        print(f"♻️ User loopback deleted: {name} (helper ok={ok})")
+        return ok
+
+    STICKY_FILE = "sticky_ports.json"
+
+    def _sticky_path(self):
+        import os
+        return os.path.join(os.path.dirname(os.path.abspath(__file__)), self.STICKY_FILE)
+
+    def _load_sticky(self):
+        """Φορτώνει τις προηγούμενες αντιστοιχίσεις (χρήστης, stream) -> slot, αν υπάρχουν."""
+        try:
+            with open(self._sticky_path(), "r", encoding="utf-8") as f:
+                rows = json.load(f)
+            self.sticky_slots = {(u, st): slot for u, st, slot in rows if slot in self.vmidi_pool}
+            if self.sticky_slots:
+                print(f"📌 Sticky ports loaded: {self.sticky_slots}")
+        except FileNotFoundError:
+            self.sticky_slots = {}
+        except Exception as e:
+            print("⚠️ sticky ports load failed:", e)
+            self.sticky_slots = {}
+
+    def _save_sticky(self):
+        try:
+            rows = [[u, st, slot] for (u, st), slot in self.sticky_slots.items()]
+            with open(self._sticky_path(), "w", encoding="utf-8") as f:
+                json.dump(rows, f, ensure_ascii=False)
+        except Exception as e:
+            print("⚠️ sticky ports save failed:", e)
+
+    def allocate_vmidi_slot(self, key=None):
+        """Επιστρέφει ένα ελεύθερο port του pool (ή None).
+        Με key=(χρήστης, stream): αν αυτή η συσκευή είχε πάρει ξανά slot και είναι ελεύθερο, παίρνει το ίδιο.
+        Αλλιώς προτιμάται slot που δεν είναι δεσμευμένο για κάποιον άλλον (ώστε να μη χαθεί η θύρα
+        ενός χρήστη που λείπει προσωρινά)."""
+        used = {r.get("vmidi") for r in self.routing_config.values()}
+        sticky = getattr(self, "sticky_slots", {})
+
+        if key is not None:
+            preferred = sticky.get(key)
+            if preferred in self.vmidi_pool and preferred not in used:
+                return preferred
+
+        reserved = {slot for k, slot in sticky.items() if k != key}
+        free = [n for n in self.vmidi_pool if n not in used]
+        choice = next((n for n in free if n not in reserved), None) or (free[0] if free else None)
+
+        if choice and key is not None:
+            for k in [k for k, v in sticky.items() if v == choice and k != key]:
+                sticky.pop(k)          # το slot ξαναχρησιμοποιείται: η παλιά δέσμευση ακυρώνεται
+            sticky[key] = choice
+            self._save_sticky()
+        return choice
+
+    def ensure_vmidi_bridge(self):
+        if getattr(self, "vmidi", None):
+            return
+        try:
+            import os
+            base_dir = os.path.dirname(os.path.abspath(__file__))
+            wms_exe = os.path.join(base_dir, "wms", "midiroomsports_wms.exe")
+            exe_path = wms_exe if os.path.exists(wms_exe) else os.path.join(base_dir, "midiroomsports.exe")
+            print("DEBUG helper exe path:", exe_path)
+            extra = ["--nosweep"] if os.environ.get("MIDIROOMS_NOSWEEP") else []
+            self.vmidi = VirtualMidiBridge(exe_path, extra)
+            print("✅ vmidi bridge started")
+        except Exception as e:
+            self.vmidi = None
+            print("❌ Could not start midiroomsports.exe:", e)
+
+    def refresh_username_label(self):
+        if hasattr(self, "username_display"):
+            self.username_display.setText(f"User: {self.username or '-'}")
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        if hasattr(self, "username_display"):
+            self.username_display.setGeometry(self.width() - 240, 32, 220, 24)
+    def sanitize_vmidi_name(self, s: str, max_len: int = 31) -> str:
+        s = (s or "").strip()
+        s = re.sub(r"[^A-Za-z0-9_]+", "_", s)
+        s = re.sub(r"_+", "_", s).strip("_")
+        return (s[:max_len] or "midiport")
+
+    def _tag(self, s: str, n: int) -> str:
+        s = re.sub(r"[^A-Za-z0-9]+", "", (s or "").strip()).lower()
+        return (s[:n] or "x")
+
+    def _dev_tag(self, dev_name: str, n: int = 4) -> str:
+        dn = (dev_name or "").lower()
+        if "mpk" in dn: return "mpk"
+        if "akai" in dn: return "akai"
+        if "launchkey" in dn: return "lk"
+        if "novation" in dn: return "nov"
+        if "keyboard" in dn or "key" in dn: return "key"
+        if "pad" in dn: return "pad"
+        if "drum" in dn: return "drm"
+        return self._tag(dev_name, n)
+
+    def _stream_idx(self, stream_id: str, fallback: int = 1) -> int:
+        m = re.search(r"_(\d+)$", stream_id or "")
+        return int(m.group(1)) if m else fallback
+
+    def _short_user(self, username: str, n: int = 8) -> str:
+        return self._tag(username or "user", n)
+
+    def _short_dev(self, dev_name: str, n: int = 4) -> str:
+        return self._dev_tag(dev_name, n)
+
+    def _suffix(self) -> str:
+        s = getattr(self, "instance_suffix", "X")
+        s = re.sub(r"[^A-Za-z0-9]+", "", str(s))[:2]
+        return s or "X"
+
+    def make_local_port_name_default(self) -> str:
+        user = self._short_user(getattr(self, "username", "") or "user", 8)
+        suf = self._suffix()
+        return f"{user}_main_{suf}"[:31]
+
+    def make_remote_port_name(self, sender: str, device: str, stream_id: str) -> str:
+        user = re.sub(r"[^A-Za-z0-9]+", "", sender or "user")[:10] or "user"
+        dev = re.sub(r"[^A-Za-z0-9]+", "_", display_name(device)).strip("_") or "midi"
+        return f"{user}_{dev}"[:PORT_BASE_MAX]
+
+    def open_remote_port(self, key, device):
+        """Δημιουργεί loopback ζεύγος για (χρήστης, stream). Επιστρέφει το όνομα ή None."""
+        self.ensure_vmidi_bridge()
+        if not getattr(self, "vmidi", None):
+            return None
+        sender, stream = key
+        base = self.make_remote_port_name(sender, device, stream)
+        name, n = base, 2
+        while name in self.created_vmidi_ports:
+            suffix = f"_{n}"
+            name = base[:PORT_BASE_MAX - len(suffix)] + suffix
+            n += 1
+        if self.vmidi.create(name, settle=0.2):
+            self.created_vmidi_ports.add(name)
+            return name
+        return None
+
+    def close_remote_port(self, name):
+        if not name or name == getattr(self, "metronome_port_name", None):
+            return
+        if getattr(self, "vmidi", None) and name in self.created_vmidi_ports:
+            self.vmidi.close(name)
+            self.created_vmidi_ports.discard(name)
+            print(f"♻️ Closed port {name}")
+
+    def make_stream_id(self, dev_name: str, idx: int) -> str:
+        base = "".join(c if c.isalnum() else "_" for c in (display_name(dev_name) or "device")).strip("_")
+        base = "_".join(base.split("_"))
+        base = base[:24] if base else f"dev{idx}"
+        return f"{base}_{idx}"
+
+    async def handle_offer(self, data):
+        return
+
+        print("📩 handle_offer called for", self.username)
+
+        # ensure pc exists
+        if not self.room_window.pc:
+            print("⚠️ handle_offer called before PC initialized!")
+        else:
+            print("📩 handle_offer using existing PC:", self.room_window.pc)
+
+        desc = RTCSessionDescription(sdp=data["sdp"], type="offer")
+        await self.room_window.pc.setRemoteDescription(desc)
+        print("📡 Remote description set (offer)")
+
+        answer = await self.room_window.pc.createAnswer()
+        await self.room_window.pc.setLocalDescription(answer)
+        print("📡 Local answer created")
+
+        await self.ws.send(json.dumps({
+            "type": "answer",
+            "room": data["room"],
+            "sdp": self.room_window.pc.localDescription.sdp,
+            "sdpType": self.room_window.pc.localDescription.type
+        }))
+        print("📤 Sent ANSWER to server")
+
+    async def handle_answer(self, data):
+        return
+
+        print("📩 handle_answer called for", self.username)
+        desc = RTCSessionDescription(sdp=data["sdp"], type=data.get("sdpType", "answer"))
+        await self.room_window.pc.setRemoteDescription(desc)
+        print("📡 Remote description set (answer)")
+
+    async def handle_candidate(self, data):
+        return
+
+        print("📩 handle_candidate called for", self.username)
+        from aiortc import RTCIceCandidate
+        c = data.get("candidate")
+        if c and self.room_window.pc:
+            ice = RTCIceCandidate(
+                sdpMid=c.get("sdpMid"),
+                sdpMLineIndex=c.get("sdpMLineIndex"),
+                candidate=c.get("candidate")
+            )
+            await self.room_window.pc.addIceCandidate(ice)
+            print("🧊 Added remote ICE candidate")
+
+    async def listen_for_rooms(self):
+        while True:
+            try:
+                async with websockets.connect(SIGNALING_SERVER, ping_interval=20, ping_timeout=60, compression=None) as ws:
+                    self.ws = ws
+                    await ws.send(json.dumps({
+                        "type": "hello",
+                        "user": self.username or "Unknown"
+                    }))
+
+                    # Αν είμαστε ήδη μέσα σε δωμάτιο (reconnect), ο server μας έχει ξεχάσει
+                    # (το αφαιρεί στο finally). Ξαναμπαίνουμε και ξαναστέλνουμε τα streams.
+                    rw = self.room_window
+                    if rw and not getattr(rw, "_left", False):
+                        print(f"🔁 Reconnected — re-joining room '{rw.room_name}'")
+                        await ws.send(json.dumps({
+                            "type": "join",
+                            "room": rw.room_name,
+                            "user": self.username
+                        }))
+                        QtCore.QTimer.singleShot(500, rw.send_streams_announce)
+
+                    async for message in ws:
+                        data = json.loads(message)
+                        if data.get("type") == "clock_sync_reply":
+                            if self.room_window:
+                                self.room_window.handle_clock_sync(data)
+                            continue
+                        if data.get("tcp_midi") or data.get("tcp_relay"):
+                            if self.room_window:
+                                self.room_window.on_midi_message(json.dumps(data))
+                            continue
+                        if data.get("type") == "room_list":
+                            rooms = data.get("rooms", [])
+                            QtCore.QMetaObject.invokeMethod(
+                                self,
+                                "_update_room_list",
+                                QtCore.Qt.QueuedConnection,
+                                QtCore.Q_ARG(list, rooms)
+                            )
+                        elif data.get("type") == "user_list":
+                            users = data.get("users", [])
+                            if self.room_window:
+                                # Update current connected users
+                                self.room_window.update_user_list(users, data.get("ips"))
+
+                        elif data["type"] == "leader":
+                            leader = data.get("leader")
+                            if self.room_window and data.get("room") == self.room_window.room_name:
+                                self.room_leader = leader
+                                self.room_window.update_leader_ui(leader)
+
+                        elif data["type"] == "kicked":
+                            if self.room_window and data.get("room") == self.room_window.room_name:
+                                by = data.get("by", "leader")
+                                QMessageBox.warning(self.room_window, "Kicked", f"You were kicked by {by}.")
+                                self.room_window.leave_room()
+                        elif data["type"] in ("offer", "answer"):
+                            if self.room_window:
+                                asyncio.ensure_future(self.room_window.p2p_on_signal(data))
+
+
+            except Exception as e:
+                print("listen_for_rooms error:", e)
+            await asyncio.sleep(2)  # retry
+
+    @QtCore.pyqtSlot(list)
+    def _update_room_list(self, rooms):
+        self.ui.serverListWidget.clear()
+        self.ui.serverListWidget.addItems(rooms)
+
+    async def connect_to_room(self):
+        if not self.username:
+            QMessageBox.warning(self, "No Username", "Username not initialized.")
+            return
+
+        selected = self.ui.serverListWidget.selectedItems()
+        if not selected:
+            QMessageBox.warning(self, "No Room", "Please select a room first.")
+            return
+
+        self.selected_room = selected[0].text()
+        self.ensure_vmidi_bridge()
+
+        self.hide()
+        self.room_window = RoomWindow(self, room_name=self.selected_room, is_creator=False)
+        self.room_window.show()
+        self.room_window.add_user_ui(self.username)
+
+        loop = asyncio.get_event_loop()
+        loop.create_task(self.room_window.start_webrtc())
+        await asyncio.sleep(0.2)
+
+    def refresh_midi_state(self):
+        print("🔄 Refreshing MIDI state...")
+
+        # Close cached Python-side mido outputs to virtual ports.
+        # This does NOT close/destroy the virtual ports themselves.
+        try:
+            if getattr(self, "vmidi", None):
+                for name, out in list(self.vmidi.output_cache.items()):
+                    try:
+                        out.close()
+                    except Exception:
+                        pass
+                self.vmidi.output_cache.clear()
+        except Exception as e:
+            print("⚠️ refresh_midi_state output cache cleanup error:", e)
+
+        try:
+            print("INPUTS after refresh:", mido.get_input_names())
+            print("OUTPUTS after refresh:", mido.get_output_names())
+        except Exception as e:
+            print("⚠️ refresh_midi_state mido query error:", e)
+
+        print("✅ MIDI state refresh done")
+    def open_settings_window(self):
+        self.settings_window = SettingsWindow(self)
+        self.settings_window.show()
+
+    def open_room_settings(self):
+        dlg = RoomSettingsWindow(self)
+        dlg.show()
+
+    def closeEvent(self, event):
+        # Close ALL vmidi ports we created (local + remote)
+        try:
+            if getattr(self, "vmidi", None):
+                for name in list(self.created_vmidi_ports):
+                    try:
+                        self.vmidi.close(name)
+                    except Exception:
+                        pass
+                self.created_vmidi_ports.clear()
+
+                try:
+                    self.vmidi.shutdown()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        event.accept()
+        QtWidgets.QApplication.quit()
+
+
+class SettingsWindow(QWidget):
+    def __init__(self, main_app=None):
+        super().__init__()
+        self.ui = Ui_SettingsForm()
+        self.ui.setupUi(self)
+        self.setWindowTitle("Settings")
+        self.main_app = main_app
+        self.ui.okButton.clicked.connect(self.apply_settings)
+        self.ui.cancelButton.clicked.connect(self.close)
+        self.ui.refreshButton.clicked.connect(self.refresh_devices)
+        self.load_midi_devices()
+
+    def load_midi_devices(self, checked=None):
+        import mido
+        from PyQt5 import QtCore, QtWidgets
+
+        self.ui.inputsList.clear()
+
+        created = getattr(self.main_app, "created_vmidi_ports", set()) if self.main_app else set()
+
+        # Only show REAL inputs (exclude our created ports)
+        input_names = [
+            n for n in mido.get_input_names()
+            if n not in created
+            and not is_internal_port(n)
+            and not n.lower().startswith("midirooms.")
+        ]
+
+        if checked is not None:
+            selected_inputs = checked
+        else:
+            selected_inputs = getattr(self.main_app, "selected_inputs", []) or []
+        selected_bases = {base_name(x) for x in selected_inputs}
+
+        for disp_name, name in device_choices(input_names):
+            item = QtWidgets.QListWidgetItem(disp_name)
+            item.setData(QtCore.Qt.UserRole, name)     # πραγματικό όνομα (για το άνοιγμα της συσκευής)
+            item.setFlags(item.flags() | QtCore.Qt.ItemIsUserCheckable)
+            checked = name in selected_inputs or base_name(name) in selected_bases
+            item.setCheckState(QtCore.Qt.Checked if checked else QtCore.Qt.Unchecked)
+            self.ui.inputsList.addItem(item)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self.main_app:
+            self.main_app.refresh_midi_state()
+        self.load_midi_devices()
+
+    def _get_checked_inputs_from_ui(self) -> list[str]:
+        selected = []
+        for i in range(self.ui.inputsList.count()):
+            item = self.ui.inputsList.item(i)
+            if item.checkState() == QtCore.Qt.Checked:
+                selected.append(item.data(QtCore.Qt.UserRole) or item.text())
+        return selected
+
+    def refresh_devices(self):
+        keep = self._get_checked_inputs_from_ui()  # κρατάμε ό,τι έχετε τσεκάρει αυτή τη στιγμή
+        if self.main_app:
+            self.main_app.refresh_midi_state()
+        self.load_midi_devices(checked=keep)
+
+    def apply_settings(self):
+        selected_inputs = self._get_checked_inputs_from_ui()
+        if self.main_app:
+            self.main_app.selected_inputs = selected_inputs
+            self.main_app.midi_service_was_refreshed = True
+            self.main_app.midi_refresh_time = time.time()
+        self.close()
+
+
+if __name__ == "__main__":
+    # ---- crash logging ----
+    # Το PyQt5 τερματίζει ΟΛΗ την εφαρμογή (qFatal) αν ένα slot πετάξει exception.
+    # Με custom excepthook το exception τυπώνεται/γράφεται και η εφαρμογή συνεχίζει.
+    # Το faulthandler γράφει στο αρχείο και τα native crashes (π.χ. μέσα στο rtmidi).
+    import faulthandler, traceback, os as _os
+    _log_dir = _os.path.dirname(_os.path.abspath(__file__))
+    _crash_log = open(_os.path.join(_log_dir, "midirooms_crash.log"), "a")
+    faulthandler.enable(_crash_log)
+
+    def _excepthook(t, v, tb):
+        traceback.print_exception(t, v, tb)
+        try:
+            with open(_os.path.join(_log_dir, "midirooms_error.log"), "a") as f:
+                f.write(f"\n--- {datetime.now()} ---\n")
+                traceback.print_exception(t, v, tb, file=f)
+        except Exception:
+            pass
+    sys.excepthook = _excepthook
+
+    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_EnableHighDpiScaling, True)
+    QtWidgets.QApplication.setAttribute(QtCore.Qt.AA_UseHighDpiPixmaps, True)
+    import ctypes
+    ctypes.windll.winmm.timeBeginPeriod(1)   # set timer resolution to 1 ms
+    app = QtWidgets.QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)
+    loop = QEventLoop(app)
+    asyncio.set_event_loop(loop)
+
+    dlg = UsernameDialog()
+    if dlg.exec_() != QtWidgets.QDialog.Accepted:
+        sys.exit(0)
+
+    window = MidiUserApp()
+    window.username = dlg.username
+    window.refresh_username_label()
+    window.init_vmidi_pool()      # δημιουργία ΟΛΩΝ των virtual ports πριν ανοίξει οποιαδήποτε είσοδος
+    window.show()
+
+    with loop:
+        loop.run_forever()
+    ctypes.windll.winmm.timeEndPeriod(1)
+
+    # Τερματισμός χωρίς destructors: αν κάποιο MIDI input δεν έκλεισε σωστά (_zombie_ports),
+    # ο destructor του RtMidi θα έκανε διπλό delete και θα κρασάριζε τη διεργασία.
+    try:
+        sys.stdout.flush()
+    except Exception:
+        pass
+    _os._exit(0)

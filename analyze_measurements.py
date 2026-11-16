@@ -14,12 +14,12 @@ analyze_measurements.py — μετρικές του σχεδίου αξιολό�
      (late όταν buffer − transit < 0), με effective delay d = max(buffer, transit + 2) (p50/p99).
   4. Κλάσεις παραθύρων 5 s (Perfect / Impaired < 15 % late / Damaged ≥ 15 %) για κάθε buffer.
   5. Effective delay της εκτέλεσης (στήλη eff_delay_ms): p50/p99.
-  6. Batch spread: νότες note_on ίδιου (user, stream) με sender_ts εντός --batch-ms ομαδοποιούνται (συγχορδία)·
+  6. Batch spread: νότες note_on ίδιου (user, stream, κανάλι) με sender_ts εντός --batch-ms ομαδοποιούνται (συγχορδία)·
      spread = max(played_s) − min(played_s) ανά ομάδα με ≥ 2 νότες.
   7. Long-run: ανά λεπτό p99 transit και late %, σύγκριση πρώτου τετάρτου της διάρκειας με το υπόλοιπο.
   8. Clock offset (server_offset_ms): μέσος, drift (κλίση ms/λεπτό), μέγιστη απότομη μεταβολή, μέσο server_jitter_ms.
   9. Απώλεια: κενά στο seq ανά (user, stream) και, αν δοθεί --sent, σύγκριση με το SENT του αποστολέα.
-  10. Διαδρομή (via): πλήθος p2p / server.
+  10. Διαδρομή (via): πλήθος p2p / relay (μέσω server).
 Περιορισμοί: το transit_est_ms εξαρτάται από το clock offset (ίδια μηχανή: αμελητέο· δύο μηχανήματα: φράσσεται
 από RTT/2 − min RTT). Το IPDV δεν επηρεάζεται από σταθερό σφάλμα offset.
 """
@@ -62,7 +62,7 @@ def load(path):
             if tr is None or sd is None or ar is None:
                 continue
             rows.append({
-                "user": r.get("user", ""), "stream": r.get("stream", ""), "type": r.get("type", ""),
+                "user": r.get("user", ""), "stream": r.get("stream", ""), "type": r.get("type", ""), "ch": r.get("ch", ""),
                 "seq": int(float(r["seq"])) if r.get("seq") not in (None, "") else None,
                 "arr": ar, "snd": sd, "transit": tr,
                 "slack": fl(r.get("slack_ms")), "late": int(fl(r.get("late")) or 0),
@@ -110,7 +110,7 @@ def analyze(path, a, sent=None):
     for r in rows:
         via[r["via"] or "?"] += 1
     print("via:", ", ".join(f"{k}={v}" for k, v in sorted(via.items())))
-    M["via_p2p"], M["via_server"] = via.get("p2p", 0), via.get("server", 0)
+    M["via_p2p"], M["via_relay"] = via.get("p2p", 0), via.get("relay", 0) + via.get("server", 0)
 
     # 1. OWD
     lo, hi = pct(tr, 2.5), pct(tr, 97.5)
@@ -181,8 +181,9 @@ def analyze(path, a, sent=None):
     # 6. Batch spread
     on = [r for r in rows if r["type"] == "note_on" and r["played"] is not None]
     groups = []
-    for k in by:
-        v = sorted((r for r in on if (r["user"], r["stream"]) == k), key=lambda r: r["snd"])
+    gk = (lambda r: (r["user"], r["stream"])) if a.batch_any_channel else (lambda r: (r["user"], r["stream"], r["ch"]))
+    for k in sorted({gk(r) for r in on}):
+        v = sorted((r for r in on if gk(r) == k), key=lambda r: r["snd"])
         cur = []
         for r in v:
             if cur and (r["snd"] - cur[0]["snd"]) * 1000 > a.batch_ms:
@@ -194,7 +195,7 @@ def analyze(path, a, sent=None):
     chords = [g for g in groups if len(g) >= 2]
     if chords:
         sp_ = [(max(r["played"] for r in g) - min(r["played"] for r in g)) * 1000 for g in chords]
-        print(f"\n[5] Batch spread ({len(chords)} συγχορδίες, ομαδοποίηση ≤ {a.batch_ms:g} ms στον αποστολέα, ms)")
+        print(f"\n[5] Batch spread ({len(chords)} συγχορδίες, ίδιο {'stream' if a.batch_any_channel else 'κανάλι'}, ομαδοποίηση ≤ {a.batch_ms:g} ms στον αποστολέα, ms)")
         print(f"    p50 {pct(sp_,50):.2f}   p95 {pct(sp_,95):.2f}   max {max(sp_):.2f}   μέγεθος ομάδας μέσο {st.mean(len(g) for g in chords):.1f}")
         M.update(chords=len(chords), batch_spread_p50=round(pct(sp_, 50), 3), batch_spread_p95=round(pct(sp_, 95), 3),
                  batch_spread_max=round(max(sp_), 3))
@@ -294,6 +295,7 @@ def main():
     ap.add_argument("--spike", type=float, default=100.0, help="όριο spike σε ms (100)")
     ap.add_argument("--window", type=float, default=5.0, help="παράθυρο ταξινόμησης σε s (5)")
     ap.add_argument("--batch-ms", type=float, default=3.0, help="ομαδοποίηση συγχορδίας (3 ms)")
+    ap.add_argument("--batch-any-channel", action="store_true", help="η συγχορδία να μην περιορίζεται στο ίδιο MIDI κανάλι (παλιά συμπεριφορά)")
     ap.add_argument("--plots", action="store_true")
     a = ap.parse_args()
     files = []

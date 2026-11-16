@@ -29,8 +29,8 @@ except Exception as _p2p_err:          # χωρίς aiortc η εφαρμογή �
 
 # ---- P2P ρυθμίσεις ----
 P2P_ENABLED = True              # False => μόνο relay μέσω server (όπως το midirooms.py)
-P2P_CONNECT_TIMEOUT_S = 10      # αν δεν ανοίξει το DataChannel μέσα σε τόσο, το ζευγάρι πάει σε relay μέσω server
-P2P_RETRY_AT_S = 4              # ένα δεύτερο offer, αν χάθηκε το πρώτο (π.χ. ο άλλος δεν ήταν έτοιμος)
+P2P_CONNECT_TIMEOUT_S = 30     # αν δεν ανοίξει το DataChannel μέσα σε τόσο, το ζευγάρι πάει σε relay μέσω server
+P2P_RETRY_AT_S = 20              # ένα δεύτερο offer, αν χάθηκε το πρώτο (π.χ. ο άλλος δεν ήταν έτοιμος)
 P2P_MAX_ACK_AGE_S = 3.0         # αν ένα event μένει τόσο χωρίς ack, το link θεωρείται χαλασμένο (πριν: 1,5 s)
 P2P_HEDGE_S = 0.3               # event χωρίς ack για τόσο => στέλνεται ΚΑΙ μέσω server (ο παραλήπτης κρατά το πρώτο που φτάνει).
                                 # None = απενεργοποιημένο

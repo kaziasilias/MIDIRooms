@@ -107,6 +107,70 @@ import subprocess, threading, queue
 import csv as _csv_module
 from datetime import datetime as _dt
 
+
+class _BgWriter:
+    """Νήμα που κάνει τις αργές δουλειές εξόδου (print στην κονσόλα, εγγραφές και flush σε CSV),
+    ώστε να μην τις κάνει το κύριο νήμα (GUI/δίκτυο/αναπαραγωγή). Ό,τι αφορά τα αρχεία περνά από ουρά.
+    Τα widgets του Qt ΔΕΝ αγγίζονται ποτέ από εδώ."""
+    _inst = None
+
+    @classmethod
+    def get(cls):
+        if cls._inst is None:
+            cls._inst = cls()
+        return cls._inst
+
+    def __init__(self):
+        self.q = queue.Queue()
+        self._dirty = set()
+        self._t = threading.Thread(target=self._run, name="midirooms-writer", daemon=True)
+        self._t.start()
+
+    def print(self, text):
+        self.q.put(("p", text))
+
+    def row(self, f, w, row):
+        self.q.put(("r", f, w, row))
+
+    def close_file(self, f, timeout=3.0):
+        ev = threading.Event()
+        self.q.put(("c", f, ev))
+        ev.wait(timeout)
+
+    def _flush(self):
+        for f in list(self._dirty):
+            try:
+                f.flush()
+            except Exception:
+                pass
+        self._dirty.clear()
+
+    def _run(self):
+        while True:
+            try:
+                item = self.q.get(timeout=0.25)
+            except queue.Empty:
+                self._flush()
+                continue
+            try:
+                k = item[0]
+                if k == "p":
+                    print(item[1])
+                elif k == "r":
+                    item[2].writerow(item[3])
+                    self._dirty.add(item[1])
+                elif k == "c":
+                    self._flush()
+                    try:
+                        item[1].close()
+                    except Exception:
+                        pass
+                    item[2].set()
+            except Exception:
+                pass
+            if self.q.empty():
+                self._flush()
+
 class ExperimentRecorder:
     """
     Καταγραφή μετρήσεων ανά νότα, ένα ζευγάρι αρχείων ανά "run" (Start/Stop από το checkbox Record CSV):
@@ -166,8 +230,7 @@ class ExperimentRecorder:
         self.active = False
         for f in (self._rf, self._sf):
             try:
-                f.flush()
-                f.close()
+                _BgWriter.get().close_file(f)      # γράφονται πρώτα όσες γραμμές περιμένουν στην ουρά
             except Exception:
                 pass
         print(f"📝 Experiment CSV closed: {self.n_recv} received, {self.n_sent} sent")
@@ -177,8 +240,8 @@ class ExperimentRecorder:
         if not self.active:
             return
         try:
-            self._sw.writerow([seq, stream, msg_type, ch, note, vel,
-                               f"{send_ts:.6f}", "" if input_ts is None else input_ts])
+            _BgWriter.get().row(self._sf, self._sw, [seq, stream, msg_type, ch, note, vel,
+                                                     f"{send_ts:.6f}", "" if input_ts is None else input_ts])
             self.n_sent += 1
         except Exception:
             pass
@@ -188,11 +251,8 @@ class ExperimentRecorder:
         if not self.active:
             return
         try:
-            self._rw.writerow([rec.get(c, "") for c in self.RECV_COLS])
+            _BgWriter.get().row(self._rf, self._rw, [rec.get(c, "") for c in self.RECV_COLS])
             self.n_recv += 1
-            if self.n_recv % 50 == 0:
-                self._rf.flush()
-                self._sf.flush()
         except Exception:
             pass
 
@@ -252,7 +312,7 @@ class LogManager:
         self.file_enabled = False
         try:
             if self.csv_file:
-                self.csv_file.close()
+                _BgWriter.get().close_file(self.csv_file)
         except Exception:
             pass
         self.csv_file = None
@@ -275,7 +335,7 @@ class LogManager:
 
         # 1) console
         if route.get("cmd", False):
-            print(f"[{cat_label}] {message}")
+            _BgWriter.get().print(f"[{cat_label}] {message}")
 
         # 2) room log (UI)
         if route.get("room", False):
@@ -288,8 +348,7 @@ class LogManager:
         if route.get("file", False) and self.file_enabled and self.csv_writer:
             try:
                 ts = _dt.now().strftime("%H:%M:%S.%f")[:-3]
-                self.csv_writer.writerow([ts, cat_label, message])
-                self.csv_file.flush()
+                _BgWriter.get().row(self.csv_file, self.csv_writer, [ts, cat_label, message])
             except Exception:
                 pass
 def force_winmm_refresh():
@@ -324,6 +383,7 @@ CHANNEL_MSG_FIELDS = {
 }
 
 # --- Συγχρονισμός / buffer αναπαραγωγής ---------------------------------------------------
+DEBUG_CALC_PRINT = False   # True: τυπώνει μία γραμμή CALC ανά νότα (αργό στην κονσόλα των Windows)
 BUFFER_MS = 40             # σταθερό buffer (ms) από τη στιγμή που πατήθηκε η νότα μέχρι να παιχτεί στον παραλήπτη
 BUFFER_MIN_MS = 0         # κάτω όριο του slider
 BUFFER_MAX_MS = 100         # άνω όριο του slider
@@ -2438,7 +2498,8 @@ class RoomWindow(QWidget):
                         "status": "nosync" if self.server_clock_offset == 0.0 else "ok",
                         "via": data.get("_via", "relay"),
                     }
-                print(f"CALC ts_server={sender_ts_server:.1f} my_offset={self.server_clock_offset:.1f} play_time={play_time:.1f} now={time.perf_counter():.1f} diff={play_time-time.perf_counter():.3f}")
+                if DEBUG_CALC_PRINT:
+                    print(f"CALC ts_server={sender_ts_server:.1f} my_offset={self.server_clock_offset:.1f} play_time={play_time:.1f} now={time.perf_counter():.1f} diff={play_time-time.perf_counter():.3f}")
                 is_noteoff = (msg_type == "note_off" or
                               (msg_type == "note_on" and effective_velocity == 0))
 

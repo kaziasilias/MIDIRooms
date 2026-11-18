@@ -90,6 +90,14 @@ async def websocket_handler(request):
     fwd = request.headers.get("X-Forwarded-For")
     client_ips[ws] = fwd.split(",")[0].strip() if fwd else (request.remote or "")
 
+    # δημόσια διεύθυνση της σύνδεσης (IP:port όπως τη βλέπει ο server, μετά το NAT) — για TCP hole punching
+    try:
+        peername = request.transport.get_extra_info("peername")
+        if peername and not fwd and "." in str(peername[0]):
+            await ws.send_str(json.dumps({"type": "your_endpoint", "ip": peername[0], "port": peername[1]}))
+    except Exception as e:
+        print("⚠️ could not send your_endpoint:", e)
+
     await ws.send_str(json.dumps({"type": "room_list", "rooms": list(rooms.keys())}))
     clients.add(ws)
 

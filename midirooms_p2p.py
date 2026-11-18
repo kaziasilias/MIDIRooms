@@ -18,7 +18,7 @@ import websockets
 import csv
 from datetime import datetime
 from qasync import QEventLoop
-import uuid, types
+import uuid, types, threading
 from collections import OrderedDict, deque
 try:
     from aiortc import RTCPeerConnection, RTCConfiguration, RTCIceServer, RTCSessionDescription
@@ -27,14 +27,23 @@ except Exception as _p2p_err:          # χωρίς aiortc η εφαρμογή �
     P2P_AVAILABLE = False
     print("⚠️ aiortc not available — P2P disabled, server relay only:", _p2p_err)
 
+try:
+    import tcp_punch
+except Exception as _tcp_err:
+    tcp_punch = None
+    print("⚠️ tcp_punch not available — TCP P2P disabled:", _tcp_err)
+
 # ---- P2P ρυθμίσεις ----
 P2P_ENABLED = True              # False => μόνο relay μέσω server (όπως το midirooms.py)
-P2P_CONNECT_TIMEOUT_S = 30     # αν δεν ανοίξει το DataChannel μέσα σε τόσο, το ζευγάρι πάει σε relay μέσω server
-P2P_RETRY_AT_S = 20              # ένα δεύτερο offer, αν χάθηκε το πρώτο (π.χ. ο άλλος δεν ήταν έτοιμος)
+P2P_TRANSPORT = "tcp"           # "tcp" = πραγματικό TCP με hole punching (tcp_punch.py, θέλει server με your_endpoint)
+                                # "webrtc" = DataChannel (ordered=False, maxRetransmits=0) + RedundantLink
+P2P_CONNECT_TIMEOUT_S = 10      # αν δεν ανοίξει το DataChannel μέσα σε τόσο, το ζευγάρι πάει σε relay μέσω server
+P2P_RETRY_AT_S = 4              # ένα δεύτερο offer, αν χάθηκε το πρώτο (π.χ. ο άλλος δεν ήταν έτοιμος)
 P2P_MAX_ACK_AGE_S = 3.0         # αν ένα event μένει τόσο χωρίς ack, το link θεωρείται χαλασμένο (πριν: 1,5 s)
 P2P_HEDGE_S = 0.3               # event χωρίς ack για τόσο => στέλνεται ΚΑΙ μέσω server (ο παραλήπτης κρατά το πρώτο που φτάνει).
                                 # None = απενεργοποιημένο
 P2P_RECONNECT_DELAYS_S = (5, 10, 20, 40, 60)   # αναμονή πριν από κάθε νέα προσπάθεια P2P μετά από πτώση (μετά: 60 s)
+P2P_STRICT = True               # True: το MIDI πάει ΜΟΝΟ P2P — ποτέ μέσω server· αν δεν υπάρχει link, περιμένει (ξαναδοκιμάζει συνεχώς)
 P2P_RECONNECT_MAX = 12          # μέγιστες προσπάθειες επανασύνδεσης ανά ζευγάρι
 P2P_STATS_EVERY_S = 2.0         # διαγνωστικά στο log: στατιστικά του link κάθε τόσα δευτερόλεπτα (όταν υπάρχει κίνηση)
 P2P_STALL_LOG_S = 0.4           # ... και άμεσα όταν ένα event μένει χωρίς ack περισσότερο από αυτό
@@ -1087,12 +1096,15 @@ class RoomWindow(QWidget):
 
     # ============================ P2P (WebRTC DataChannel) ============================
     def p2p_active(self):
+        if P2P_TRANSPORT == "tcp":
+            return bool(P2P_ENABLED and tcp_punch is not None) and not self._left
         return bool(P2P_ENABLED and P2P_AVAILABLE) and not self._left
 
     def _p2p_new_peer(self, user):
         peer = types.SimpleNamespace(user=user, pc=None, channel=None, link=None, state="new",
                                      t0=time.perf_counter(), attempt=0, initiator=False,
-                                     reconn=None, reconn_n=0, stats=None)
+                                     reconn=None, reconn_n=0, stats=None,
+                                     punch_stop=None, remote_tcp=None, link_initiator=None, punch_started=False)
         self.p2p_peers[user] = peer
         return peer
 
@@ -1129,11 +1141,17 @@ class RoomWindow(QWidget):
         return pc
 
     def _p2p_drop_pc(self, peer, flush=True):
+        if peer.punch_stop is not None:        # σταμάτα τα connect() του TCP hole punching
+            peer.punch_stop.set()
+            peer.punch_stop = None
+        peer.punch_started = False
+        peer.remote_tcp = None
+        peer.link_initiator = None
         if peer.link:
             pend = [] if (peer.link.broken or not flush) else peer.link.pending_events()
             peer.link.close()
             peer.link = None
-            if pend and self.main_app.ws:        # ό,τι δεν επιβεβαιώθηκε ακόμα πάει μέσω server (ο παραλήπτης αγνοεί διπλότυπα)
+            if pend and self.main_app.ws and not P2P_STRICT:        # ό,τι δεν επιβεβαιώθηκε ακόμα πάει μέσω server (ο παραλήπτης αγνοεί διπλότυπα)
                 for ev in pend:
                     asyncio.ensure_future(self.main_app.ws.send(json.dumps({**ev, "to": peer.user})))
         try:
@@ -1199,7 +1217,7 @@ class RoomWindow(QWidget):
     def _p2p_hedge(self, peer, events):
         """Event χωρίς ack για P2P_HEDGE_S: στέλνεται ΚΑΙ μέσω server (dedup στον παραλήπτη)."""
         ws = self.main_app.ws
-        if ws:
+        if ws and not P2P_STRICT:
             for ev in events:
                 asyncio.ensure_future(ws.send(json.dumps({**ev, "to": peer.user})))
 
@@ -1225,6 +1243,8 @@ class RoomWindow(QWidget):
                 pc = peer.pc
                 buf = getattr(peer.channel, "bufferedAmount", None)
                 extra = (_p2p_sctp_info(pc) if pc else "") + (f" buf={buf}" if buf is not None else "")
+                if snap.get("wbuf") is not None:
+                    extra += f" wbuf={snap['wbuf']}"
                 self.log_manager.log(
                     "SYSTEM",
                     f"📊 P2P {peer.user}{' STALL' if stalled else ''}: sent+{d('sent')} retx+{d('retx')} "
@@ -1248,15 +1268,15 @@ class RoomWindow(QWidget):
         peer.state = "failed"
         info = peer.link.break_info if peer.link is not None and peer.link.break_info else {}
         fmt = lambda v: "-" if v is None else f"{v:.0f}"
-        self.log_manager.log("SYSTEM", f"⚠️ P2P link with {peer.user} stopped answering — using the server relay "
-                                       f"({len(pending)} pending events resent)")
+        self.log_manager.log("SYSTEM", f"⚠️ P2P link with {peer.user} stopped answering — "
+                                       + (f"waiting for P2P to come back ({len(pending)} pending events dropped)" if P2P_STRICT else f"using the server relay ({len(pending)} pending events resent)"))
         self.log_manager.log("SYSTEM", f"🔍 P2P break reason: oldest event {fmt(info.get('oldest_ms'))} ms without ack "
                                        f"(limit {P2P_MAX_ACK_AGE_S * 1000:.0f} ms), nothing received for "
                                        f"{fmt(info.get('since_rx_ms'))} ms, last ack {fmt(info.get('since_ack_ms'))} ms ago, "
-                                       f"retx {info.get('retx', '-')}, hedged {info.get('hedged', '-')}, "
+                                       f"reason {info.get('reason', '-')}, retx {info.get('retx', '-')}, hedged {info.get('hedged', '-')}, "
                                        f"{_p2p_sctp_info(peer.pc) if peer.pc else ''}")
         ws = self.main_app.ws
-        if ws:
+        if ws and not P2P_STRICT:
             for ev in pending:
                 asyncio.ensure_future(ws.send(json.dumps({**ev, "to": peer.user})))
         self._p2p_schedule_reconnect(peer)
@@ -1267,7 +1287,7 @@ class RoomWindow(QWidget):
         if peer.state == "up" and peer.link is not None and not peer.link.broken:
             peer.link.close()
         peer.state = "failed"
-        self.log_manager.log("SYSTEM", f"↪️ P2P with {peer.user} not available ({reason}) — using the server relay")
+        self.log_manager.log("SYSTEM", f"↪️ P2P with {peer.user} not available ({reason}) — " + ("waiting for P2P (retrying)" if P2P_STRICT else "using the server relay"))
         self._p2p_drop_pc(peer)
         self._p2p_schedule_reconnect(peer)
 
@@ -1286,6 +1306,10 @@ class RoomWindow(QWidget):
     def p2p_close_all(self):
         for u in list(self.p2p_peers):
             self.p2p_close_peer(u)
+        pu = getattr(self, "_tcp_puncher", None)
+        if pu is not None:
+            pu.close()
+            self._tcp_puncher = None
 
     def _p2p_schedule_reconnect(self, peer):
         if not self.p2p_active() or peer.state == "closed":
@@ -1297,7 +1321,7 @@ class RoomWindow(QWidget):
     async def _p2p_reconnect_loop(self, peer):
         """Μετά από πτώση (ή αποτυχία σύνδεσης): νέο offer με αυξανόμενη αναμονή. Όσο δεν ανεβαίνει, ισχύει ο server."""
         try:
-            while (peer.reconn_n < P2P_RECONNECT_MAX and self.p2p_active()
+            while ((P2P_STRICT or peer.reconn_n < P2P_RECONNECT_MAX) and self.p2p_active()
                    and self.p2p_peers.get(peer.user) is peer and peer.state != "closed"):
                 delay = P2P_RECONNECT_DELAYS_S[min(peer.reconn_n, len(P2P_RECONNECT_DELAYS_S) - 1)]
                 peer.reconn_n += 1
@@ -1309,7 +1333,7 @@ class RoomWindow(QWidget):
                     if peer.state == "up":
                         return
                     continue
-                self.log_manager.log("SYSTEM", f"🔁 P2P with {peer.user}: reconnect attempt {peer.reconn_n}/{P2P_RECONNECT_MAX}")
+                self.log_manager.log("SYSTEM", f"🔁 P2P with {peer.user}: reconnect attempt {peer.reconn_n}" + ("" if P2P_STRICT else f"/{P2P_RECONNECT_MAX}"))
                 peer.state = "new"
                 peer.attempt = 0
                 peer.t0 = time.perf_counter()
@@ -1337,6 +1361,9 @@ class RoomWindow(QWidget):
     async def _p2p_start_offer(self, peer, watchdog=True):
         if not self.p2p_active() or peer.state not in ("new", "connecting") or not self.main_app.ws:
             return
+        if P2P_TRANSPORT == "tcp":
+            await self._p2p_tcp_start(peer, watchdog)
+            return
         try:
             peer.state = "connecting"
             peer.attempt += 1
@@ -1361,6 +1388,12 @@ class RoomWindow(QWidget):
         if not frm or frm == self.main_app.username:
             return
         peer = self.p2p_peers.get(frm) or self._p2p_new_peer(frm)
+        if data.get("type") == "candidate" and data.get("tcp"):
+            if P2P_TRANSPORT == "tcp":
+                await self._p2p_tcp_on_candidate(peer, data)
+            return
+        if P2P_TRANSPORT == "tcp":
+            return                                  # offer/answer είναι WebRTC: αγνοούνται σε TCP mode
         try:
             if data["type"] == "offer":
                 pc0 = peer.pc
@@ -1383,6 +1416,159 @@ class RoomWindow(QWidget):
         except Exception as e:
             self._p2p_fail(peer, f"signaling failed: {e}")
 
+    # ---------------- P2P πάνω από TCP (hole punching, tcp_punch.py) ----------------
+    def _p2p_tcp_candidate_msg(self, peer, reply=False):
+        mp = self.main_app
+        pub = getattr(mp, "tcp_public_ep", None)
+        lport = getattr(mp, "tcp_local_port", None)
+        if not pub or not lport:
+            return None
+        return {"type": "candidate", "tcp": True, "room": self.room_name,
+                "from": mp.username, "to": peer.user, "att": peer.attempt, "reply": bool(reply),
+                "pub": [pub[0], pub[1]], "priv": [getattr(mp, "tcp_local_ip", ""), lport]}
+
+    async def _p2p_tcp_start(self, peer, watchdog=True):
+        """Ο initiator στέλνει το TCP candidate του (δημόσιο IP:port όπως το είδε ο server + τοπικό IP:port)."""
+        if peer.attempt == 0:
+            self._p2p_drop_pc(peer)               # νέα προσπάθεια: καθάρισε ό,τι έμεινε από την προηγούμενη
+        peer.state = "connecting"
+        peer.attempt += 1
+        for _ in range(20):                       # το your_endpoint έρχεται αμέσως μετά τη σύνδεση με τον server
+            if getattr(self.main_app, "tcp_public_ep", None):
+                break
+            await asyncio.sleep(0.1)
+        msg = self._p2p_tcp_candidate_msg(peer)
+        if msg is None:
+            self._p2p_fail(peer, "the server did not report the TCP endpoint — update the server")
+            return
+        try:
+            await self.main_app.ws.send(json.dumps(msg))
+        except Exception as e:
+            self._p2p_fail(peer, f"signaling failed: {e}")
+            return
+        if watchdog:
+            asyncio.ensure_future(self._p2p_watchdog(peer))
+
+    async def _p2p_tcp_on_candidate(self, peer, data):
+        if peer.state in ("up", "closed"):
+            return
+        first = peer.state != "connecting"
+        if first:
+            self._p2p_drop_pc(peer)
+            peer.state = "connecting"
+            peer.t0 = time.perf_counter()
+            peer.attempt = 0
+        peer.remote_tcp = data
+        if not data.get("reply"):                 # απάντηση με το δικό μου candidate (και ξεκινά και ο άλλος το punching)
+            msg = self._p2p_tcp_candidate_msg(peer, reply=True)
+            if msg is None:
+                self._p2p_fail(peer, "the server did not report the TCP endpoint — update the server")
+                return
+            try:
+                await self.main_app.ws.send(json.dumps(msg))
+            except Exception as e:
+                self._p2p_fail(peer, f"signaling failed: {e}")
+                return
+            if first:
+                asyncio.ensure_future(self._p2p_watchdog(peer))
+        self._p2p_tcp_punch(peer)
+
+    def _p2p_tcp_get_puncher(self):
+        mp = self.main_app
+        lport = getattr(mp, "tcp_local_port", None)
+        pu = getattr(self, "_tcp_puncher", None)
+        if pu is not None and pu.local_port != lport:
+            pu.close()
+            pu = None
+        if pu is None and lport:
+            pu = tcp_punch.TcpPuncher(
+                lport, asyncio.get_event_loop(),
+                lambda sock, addr: asyncio.ensure_future(self._p2p_tcp_adopt(None, sock, True)),
+                log=lambda m: self.log_manager.log("SYSTEM", m))
+        self._tcp_puncher = pu
+        return pu
+
+    def _p2p_tcp_punch(self, peer):
+        rt = peer.remote_tcp
+        if not rt or peer.punch_started:
+            return
+        pu = self._p2p_tcp_get_puncher()
+        if pu is None:
+            self._p2p_fail(peer, "no local TCP port to punch from")
+            return
+        mp = self.main_app
+        pub, priv = tuple(rt["pub"]), tuple(rt["priv"])
+        my_pub = getattr(mp, "tcp_public_ep", None)
+        targets = [pub]
+        if my_pub and my_pub[0] == pub[0] and priv[0] and tuple(priv) != pub:   # ίδιο δημόσιο IP => ίδιο LAN: πρώτα η τοπική διεύθυνση
+            targets = [tuple(priv), pub]
+        peer.punch_started = True
+        peer.punch_stop = threading.Event()
+        user = peer.user
+        self.log_manager.log("SYSTEM", f"🕳️ TCP punch with {user}: local port {pu.local_port} -> "
+                                       f"{', '.join(f'{ip}:{pt}' for ip, pt in targets)}")
+        pu.connect(targets,
+                   lambda sock, tgt, user=user: asyncio.ensure_future(self._p2p_tcp_adopt(user, sock, False)),
+                   peer.punch_stop, P2P_CONNECT_TIMEOUT_S)
+
+    async def _p2p_tcp_adopt(self, expected_user, sock, inbound):
+        """Μια TCP σύνδεση στήθηκε (εισερχόμενη ή εξερχόμενη): hello, έλεγχος ταυτότητας, tie-break, link."""
+        me = self.main_app.username
+        try:
+            reader, writer = await tcp_punch.open_streams(sock)
+            hello = await tcp_punch.handshake(reader, writer, me, self.p2p_sid)
+        except Exception:
+            hello = None
+            writer = None
+        if not hello:
+            try:
+                sock.close()
+            except OSError:
+                pass
+            return
+        user = hello[0]
+        peer = self.p2p_peers.get(user)
+        if (expected_user and user != expected_user) or peer is None or self._left or peer.state == "closed":
+            writer.close()
+            return
+        initiator = user if inbound else me
+        if peer.link is not None and not peer.link.broken:
+            if peer.state == "up" and tcp_punch.prefer_new(me, user, peer.link_initiator, initiator):
+                pend = peer.link.pending_events()       # αντικατάσταση της παλιάς σύνδεσης (και οι δύο διαλέγουν την ίδια)
+                peer.link.close()
+                peer.link = None
+                if pend and self.main_app.ws and not P2P_STRICT:
+                    for ev in pend:
+                        asyncio.ensure_future(self.main_app.ws.send(json.dumps({**ev, "to": user})))
+            else:
+                writer.close()
+                return
+        if peer.punch_stop is not None:
+            peer.punch_stop.set()
+        peer.link_initiator = initiator
+        self._p2p_up_tcp(peer, reader, writer, inbound, sock)
+
+    def _p2p_up_tcp(self, peer, reader, writer, inbound, sock):
+        link = tcp_punch.TcpLink(reader, writer,
+                                 deliver=lambda ev: self._p2p_deliver(peer, ev),
+                                 on_broken=lambda pending: self._p2p_broken(peer, pending),
+                                 max_age=P2P_MAX_ACK_AGE_S)
+        peer.link = link
+        link.start()
+        peer.state = "up"
+        peer.reconn_n = 0
+        ms = (time.perf_counter() - peer.t0) * 1000
+        try:
+            la, ra = sock.getsockname(), sock.getpeername()
+            path = f"{la[0]}:{la[1]} <-> {ra[0]}:{ra[1]} ({'inbound' if inbound else 'outbound'})"
+        except OSError:
+            path = "unknown"
+        self.log_manager.log("SYSTEM", f"🔗 P2P (TCP) link up with {peer.user} ({ms:.0f} ms to connect) — MIDI goes directly")
+        self.log_manager.log("SYSTEM", f"🧭 TCP path with {peer.user}: {path}")
+        if peer.stats is not None:
+            peer.stats.cancel()
+        peer.stats = asyncio.ensure_future(self._p2p_stats_loop(peer, link))
+
     def dispatch_midi_event(self, ev):
         """Στέλνει ένα MIDI event: απευθείας (P2P) σε όσους έχουν ενεργό link, μέσω server στους υπόλοιπους."""
         me = self.main_app.username
@@ -1394,6 +1580,8 @@ class RoomWindow(QWidget):
                 if p.state == "up" and p.link is not None and not p.link.broken and (not users or u in users):
                     p.link.send(ev)
                     up.append(u)
+        if P2P_STRICT and self.p2p_active():
+            return                  # αυστηρό P2P: όσοι δεν έχουν ενεργό link δεν παίρνουν το event (δεν πέφτουμε στον server)
         rest = [u for u in users if u != me and u not in up]
         if (not users or rest) and self.main_app.ws:
             payload = ev if not up else {**ev, "exclude": up}
@@ -3819,8 +4007,22 @@ class MidiUserApp(QMainWindow):
     async def listen_for_rooms(self):
         while True:
             try:
-                async with websockets.connect(SIGNALING_SERVER, ping_interval=20, ping_timeout=60, compression=None) as ws:
+                _kw = {}
+                if tcp_punch is not None:
+                    _rs = await asyncio.get_event_loop().run_in_executor(None, tcp_punch.connect_reusable, SIGNALING_SERVER)
+                    if _rs is not None:
+                        _kw["sock"] = _rs      # socket με SO_REUSEADDR από την αρχή (απαραίτητο στα Windows για το TCP punch)
+                async with websockets.connect(SIGNALING_SERVER, ping_interval=20, ping_timeout=60, compression=None, **_kw) as ws:
                     self.ws = ws
+                    self.tcp_public_ep = None          # το στέλνει ο server (your_endpoint)
+                    try:
+                        la = ws.local_address
+                        self.tcp_local_ip, self.tcp_local_port = la[0], la[1]
+                        if tcp_punch is not None:
+                            tcp_punch.prepare_existing_socket(ws.transport.get_extra_info("socket"))
+                    except Exception as e:
+                        self.tcp_local_port = None
+                        print("⚠️ could not read the local port of the server connection:", e)
                     await ws.send(json.dumps({
                         "type": "hello",
                         "user": self.username or "Unknown"
@@ -3873,7 +4075,9 @@ class MidiUserApp(QMainWindow):
                                 by = data.get("by", "leader")
                                 QMessageBox.warning(self.room_window, "Kicked", f"You were kicked by {by}.")
                                 self.room_window.leave_room()
-                        elif data["type"] in ("offer", "answer"):
+                        elif data["type"] == "your_endpoint":
+                            self.tcp_public_ep = (data.get("ip"), data.get("port"))
+                        elif data["type"] in ("offer", "answer") or (data["type"] == "candidate" and data.get("tcp")):
                             if self.room_window:
                                 asyncio.ensure_future(self.room_window.p2p_on_signal(data))
 

@@ -390,6 +390,7 @@ BUFFER_MAX_MS = 100         # άνω όριο του slider
 ADAPTIVE_BUFFER = True      # leaky max: το buffer ανεβαίνει όταν μια νότα έρθει αργά και χαλαρώνει σιγά-σιγά
 RELAX_MS_PER_S = 10         # πόσα ms/δευτερόλεπτο "χαλαρώνει" το επιπλέον buffer (πρέπει να είναι << 1000)
 MAX_EXTRA_MS = 100          # ανώτατο επιπλέον buffer πάνω από τη βάση
+SYNC_RECENT = 20           # στατιστικά latency για τα τελευταία 20 sync (~1 λεπτό)
 SYNC_WINDOW = 8            # πόσα sync (×3 s) κοιτάμε για το δείγμα με το μικρότερο RTT
 
 PORT_PREFIX = "_MR_"                      # πρόθεμα των εσωτερικών virtual ports της εφαρμογής
@@ -625,6 +626,7 @@ class UsernameDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.ui = Ui_UsernameForm()
         self.ui.setupUi(self)
+        self.setWindowTitle("MIDIRooms Login")
         # --- responsive layout με άνετα μεγέθη ---
         self.ui.label.setAlignment(QtCore.Qt.AlignCenter)
 
@@ -649,6 +651,11 @@ class UsernameDialog(QtWidgets.QDialog):
 
         self.ui.continueButton.clicked.connect(self.on_continue)
         self.ui.usernameLine.returnPressed.connect(self.on_continue)
+        self.ui.usernameLine.setFocus()          # the cursor starts in the Username field
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QtCore.QTimer.singleShot(0, lambda: (self.activateWindow(), self.ui.usernameLine.setFocus(QtCore.Qt.OtherFocusReason)))
 
     def on_continue(self):
         text = self.ui.usernameLine.text().strip()
@@ -1011,6 +1018,7 @@ class RoomWindow(QWidget):
         self.is_creator = is_creator
         self.ui = Ui_roomwindow()
         self.ui.setupUi(self)
+        self.setWindowTitle("MIDIRooms Connections")
         # ξεκλείδωμα μεγέθους — επιτρέπει resize και maximize
         self.setMinimumSize(800, 600)
         self.setMaximumSize(16777215, 16777215)
@@ -1053,7 +1061,7 @@ class RoomWindow(QWidget):
         self.ui.pianoScrollArea.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOn)
         self.ui.pianoScrollArea.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
         self.ui.pianoScrollArea.setWidget(self.piano)
-        self.setWindowTitle(f"MIDIROOMS - {room_name}")
+        self.setWindowTitle(f"MIDIRooms Room - {room_name}")
         self.ui.LeaveButton.clicked.connect(self.leave_room)
         self.ui.logArea.clear()
         self.log_manager = LogManager(self)
@@ -1100,6 +1108,9 @@ class RoomWindow(QWidget):
         self.remote_playback_timer.start(2)
         self.server_clock_offset = 0.0  # διαφορά τοπικού ρολογιού από τον server
         self.server_rtt_samples = []  # για jitter measurement
+        # server latency statistics (one-way = RTT/2): since joining the room and over the last SYNC_RECENT syncs
+        self.server_lat_all = {"n": 0, "sum": 0.0, "min": None, "max": None}
+        self.server_lat_recent = deque(maxlen=SYNC_RECENT)
 
         from mido import open_input, open_output
 
@@ -1797,7 +1808,7 @@ class RoomWindow(QWidget):
 
                 inport = self.open_midi_input_with_retry(dev_name, retries=1, delay_ms=100)
                 if not inport:
-                    print(f"⚠️ Hotplug: {dev_name} δεν είναι ακόμα διαθέσιμη, θα ξαναδοκιμαστεί")
+                    print(f"⚠️ Hotplug: {dev_name} is not available yet, will retry")
                     continue  # ΔΕΝ βάζουμε στο failed_inputs — ο επόμενος κύκλος θα ξαναδοκιμάσει
                 self.midi_inputs.append((stream_id, inport))
                 self.stream_devices[stream_id] = dev_name
@@ -1929,10 +1940,21 @@ class RoomWindow(QWidget):
             jitter_ms = 0.0
 
         oneway_ms = rtt_ms / 2.0
+        a = self.server_lat_all
+        a["n"] += 1
+        a["sum"] += oneway_ms
+        a["min"] = oneway_ms if a["min"] is None else min(a["min"], oneway_ms)
+        a["max"] = oneway_ms if a["max"] is None else max(a["max"], oneway_ms)
+        self.server_lat_recent.append(oneway_ms)
+        r = self.server_lat_recent
+        recent_label = "last 1 min" if len(r) == SYNC_RECENT else (f"last {len(r)} syncs" if len(r) > 1 else "last 1 sync")
         # ενημέρωσε το UI (δείχνει latency προς server)
         if hasattr(self, "ui"):
             self.log_manager.log("CLOCK",
-                                 f"🕒 Server sync: latency={oneway_ms:.1f}ms jitter={jitter_ms:.1f}ms offset={offset * 1000:.1f}ms"
+                                 f"🕒 Server sync: latency={oneway_ms:.1f}ms | "
+                                 f"overall: avg {a['sum'] / a['n']:.1f} / min {a['min']:.1f} / max {a['max']:.1f} ms | "
+                                 f"{recent_label}: avg {sum(r) / len(r):.1f} / min {min(r):.1f} / max {max(r):.1f} ms | "
+                                 f"offset={offset * 1000:.1f}ms"
                                  )
     def handle_pong(self, data):
         return
@@ -1988,12 +2010,12 @@ class RoomWindow(QWidget):
             print(f"⚠️ Could not make users layout horizontal: {e}")
 
     def _auto_start_room_log(self):
-        """Προεπιλογή: το log του δωματίου αποθηκεύεται σε CSV στον φάκελο όπου τρέχει η εφαρμογή.
+        """Προεπιλογή: το log του δωματίου αποθηκεύεται ως .log στον φάκελο όπου τρέχει η εφαρμογή.
         Απενεργοποιείται από Log Settings -> Stop Saving."""
         import os, re as _re
         try:
             safe = lambda x: _re.sub(r"[^A-Za-z0-9_-]+", "_", str(x))
-            fname = f"midirooms_log_{safe(self.main_app.username)}_{safe(self.room_name)}_{_dt.now().strftime('%Y%m%d_%H%M%S')}.csv"
+            fname = f"midirooms_log_{safe(self.main_app.username)}_{safe(self.room_name)}_{_dt.now().strftime('%Y%m%d_%H%M%S')}.log"
             self.log_manager.start_file(os.path.join(os.getcwd(), fname))
         except Exception as e:
             print(f"⚠️ Could not auto-start room log: {e}")
@@ -2154,7 +2176,7 @@ class RoomWindow(QWidget):
                 # αφαίρεσε από failed_inputs ώστε το hotplug να μπορεί να την ξανανοίξει
                 if lost_dev:
                     self.failed_inputs.discard(lost_dev.lower())
-                    print(f"🔌 Συσκευή αποσυνδέθηκε: {lost_dev} — αναμένουμε επανασύνδεση")
+                    print(f"🔌 Device disconnected: {lost_dev} — waiting for it to reconnect")
                     self.log_manager.log("DEVICE",f"⚠️ MIDI device disconnected: {lost_dev} — waiting for reconnect...")
                     if getattr(self.main_app, "routing_manager_dialog", None):
                         self.main_app.routing_manager_dialog.refresh_table()
@@ -2551,10 +2573,10 @@ class RoomWindow(QWidget):
         self.bufferSlider.setRange(BUFFER_MIN_MS, BUFFER_MAX_MS)
         self.bufferSlider.setValue(BUFFER_MS)
         self.bufferSlider.setFixedWidth(120)
-        self.bufferSlider.setToolTip("Βάση buffer (ms) από τη στιγμή που πατήθηκε η νότα μέχρι να παιχτεί")
+        self.bufferSlider.setToolTip("Base buffer (ms) from the moment a note is played until it is heard")
         self.adaptiveCheck = QtWidgets.QCheckBox("Adaptive", self)
         self.adaptiveCheck.setChecked(self.adaptive_buffer)
-        self.adaptiveCheck.setToolTip("Όταν μια νότα έρθει αργά, το buffer ανεβαίνει προσωρινά και μετά επιστρέφει αργά στη βάση")
+        self.adaptiveCheck.setToolTip("When a note arrives late, the buffer rises temporarily and then slowly returns to the base value")
 
         self.ui.horizontalLayout.addWidget(self.bufferLabel)
         self.ui.horizontalLayout.addWidget(self.bufferSlider)
@@ -2566,7 +2588,7 @@ class RoomWindow(QWidget):
         self._last_pre_delay_s = self.buffer_base_s
         self._last_late = False
         self.recordCsvCheck = QtWidgets.QCheckBox("Record CSV", self)
-        self.recordCsvCheck.setToolTip("Ξεκινά/σταματά την καταγραφή μετρήσεων ανά νότα (experiment_RECEIVED/SENT_*.csv)")
+        self.recordCsvCheck.setToolTip("Starts/stops per-note measurement recording (experiment_RECEIVED/SENT_*.csv)")
         self.ui.horizontalLayout.addWidget(self.recordCsvCheck)
         self.recordCsvCheck.toggled.connect(self._on_record_csv_toggled)
 
@@ -3126,7 +3148,7 @@ class RoutingManager(QDialog):
         self.room_window = getattr(main_app, "room_window", None)
         self.ui = Ui_routingDialog()
         self.ui.setupUi(self)
-        self.setWindowTitle("MIDI Port Manager")
+        self.setWindowTitle("MIDIRooms MIDI Port Manager")
         self.resize(1000, 600)
         self.setMinimumSize(900, 500)
         self.pending = set(getattr(main_app, "selected_inputs", []) or [])  # αλλαγές σε αναμονή
@@ -3406,7 +3428,7 @@ class RoutingManager(QDialog):
         for sid in to_remove:
             room_win.stream_devices.pop(sid, None)
             room_win.failed_inputs.discard(dev_name.lower())
-        print(f"🔌 Έκλεισε MIDI input: {dev_name}")
+        print(f"🔌 Closed MIDI input: {dev_name}")
 
     def apply_changes(self):
         old = list(getattr(self.main_app, "selected_inputs", []) or [])
@@ -3442,7 +3464,7 @@ class CreateLoopbackDialog(QtWidgets.QDialog):
         super().__init__(parent)
         self.main_app = main_app
         self.created_name = None
-        self.setWindowTitle("Create Endpoint Pair")
+        self.setWindowTitle("MIDIRooms Create Endpoint Pair")
         self.setMinimumWidth(380)
         lay = QtWidgets.QVBoxLayout(self)
         lay.addWidget(QtWidgets.QLabel("Name of the new endpoint pair:"))
@@ -3475,7 +3497,7 @@ class LogSettingsDialog(QtWidgets.QDialog):
         super().__init__()
         self.room_window = room_window
         self.lm = room_window.log_manager
-        self.setWindowTitle("Log Settings")
+        self.setWindowTitle("MIDIRooms Log Settings")
         self.resize(600, 500)
 
         # αντίγραφο των ρυθμίσεων: γράφεται στο LogManager μόνο με Apply / OK
@@ -3496,7 +3518,7 @@ class LogSettingsDialog(QtWidgets.QDialog):
 
         # File controls
         file_row = QtWidgets.QHBoxLayout()
-        self.file_btn = QtWidgets.QPushButton("Stop Saving" if self.lm.file_enabled else "Start Saving to CSV...")
+        self.file_btn = QtWidgets.QPushButton("Stop Saving" if self.lm.file_enabled else "Start Saving to File...")
         self.file_btn.clicked.connect(self.toggle_file)
         file_row.addWidget(self.file_btn)
         import os as _os
@@ -3560,17 +3582,20 @@ class LogSettingsDialog(QtWidgets.QDialog):
         self.accept()
 
     def toggle_file(self):
+        import os
         if self.lm.file_enabled:
             self.lm.stop_file()
-            self.file_btn.setText("Start Saving to CSV...")
+            self.file_btn.setText("Start Saving to File...")
             self.file_label.setText("(no file)")
         else:
             fname, _ = QtWidgets.QFileDialog.getSaveFileName(
-                self, "Save log as CSV",
-                f"midirooms_log_{_dt.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                "CSV Files (*.csv)"
+                self, "Save log as .log file",
+                f"midirooms_log_{_dt.now().strftime('%Y%m%d_%H%M%S')}.log",
+                "Log Files (*.log)"
             )
             if fname:
+                if not os.path.splitext(fname)[1]:
+                    fname += ".log"           # no extension typed -> .log
                 self.lm.start_file(fname)
                 self.file_btn.setText("Stop Saving")
                 self.file_label.setText(fname.split("/")[-1])
@@ -3592,10 +3617,16 @@ class RoomSettingsWindow(QMainWindow):
         super().__init__(parent)
         self.ui = Ui_roomSettingsWindow()
         self.ui.setupUi(self)
-        self.setWindowTitle("Create Room")
+        self.setWindowTitle("MIDIRooms Create Room")
 
         self.ui.cancelButton.clicked.connect(self.close)
         self.ui.createRoomButton.clicked.connect(self.accept_settings)
+        self.ui.roomNameLineEdit.returnPressed.connect(self.accept_settings)   # Enter = Create Room
+        self.ui.roomNameLineEdit.setFocus()                                   # the cursor starts in the name field
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        QtCore.QTimer.singleShot(0, lambda: (self.activateWindow(), self.ui.roomNameLineEdit.setFocus(QtCore.Qt.OtherFocusReason)))
 
 
     def accept_settings(self):
@@ -3630,6 +3661,7 @@ class MidiUserApp(QMainWindow):
         import re
         self.ui = Ui_MainWindow()
         self.ui.setupUi(self)
+        self.setWindowTitle("MIDIRooms Connections")
         # ξεκλείδωμα μεγέθους — επιτρέπει resize και maximize
         self.setMinimumSize(800, 600)
         self.setMaximumSize(16777215, 16777215)
@@ -4232,7 +4264,7 @@ class SettingsWindow(QWidget):
         super().__init__()
         self.ui = Ui_SettingsForm()
         self.ui.setupUi(self)
-        self.setWindowTitle("Settings")
+        self.setWindowTitle("MIDIRooms MIDI Settings")
         self.main_app = main_app
         self.ui.okButton.clicked.connect(self.apply_settings)
         self.ui.cancelButton.clicked.connect(self.close)

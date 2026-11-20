@@ -28,7 +28,7 @@ import time
 import os
 import mido
 from mido import Message, MidiFile, MidiTrack, MetaMessage
-from PyQt5 import QtCore, QtWidgets
+from PyQt5 import QtCore, QtGui, QtWidgets
 
 
 import re
@@ -91,6 +91,39 @@ def safe_close(port, label=""):
 # ============================================================================
 #  MIDI PLAYER — παίζει ένα ή περισσότερα .mid ταυτόχρονα σε ένα output port
 # ============================================================================
+def make_shape_icon(shape, color):
+    """Draws a flat icon (no image files needed): 'play' = triangle, 'stop' = square, 'record' = circle."""
+    size = 64
+    pm = QtGui.QPixmap(size, size)
+    pm.fill(QtCore.Qt.transparent)
+    painter = QtGui.QPainter(pm)
+    painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+    painter.setPen(QtCore.Qt.NoPen)
+    painter.setBrush(QtGui.QColor(color))
+    m = 8
+    if shape == "play":
+        painter.drawPolygon(QtGui.QPolygon([QtCore.QPoint(m + 4, m),
+                                            QtCore.QPoint(size - m, size // 2),
+                                            QtCore.QPoint(m + 4, size - m)]))
+    elif shape == "stop":
+        painter.drawRect(m, m, size - 2 * m, size - 2 * m)
+    elif shape == "record":
+        painter.drawEllipse(m, m, size - 2 * m, size - 2 * m)
+    painter.end()
+    return QtGui.QIcon(pm)
+
+
+ICON_PLAY = "#2e9e44"      # green triangle
+ICON_STOP = "#111111"      # black square
+ICON_RECORD = "#d32f2f"    # red circle
+
+
+def set_button_icon(button, shape, color, text):
+    button.setText(text)
+    button.setIcon(make_shape_icon(shape, color))
+    button.setIconSize(QtCore.QSize(20, 20))
+
+
 class MidiPlayerTab(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
@@ -119,7 +152,7 @@ class MidiPlayerTab(QtWidgets.QWidget):
         layout.addLayout(port_row)
 
         # --- Λίστα αρχείων ---
-        layout.addWidget(QtWidgets.QLabel("MIDI αρχεία (τσέκαρε όσα θέλεις να παίξουν μαζί):"))
+        layout.addWidget(QtWidgets.QLabel("MIDI files (check the ones you want to play together):"))
         self.fileList = QtWidgets.QListWidget()
         layout.addWidget(self.fileList)
 
@@ -135,18 +168,20 @@ class MidiPlayerTab(QtWidgets.QWidget):
 
         # --- Play / Stop ---
         ctrl_row = QtWidgets.QHBoxLayout()
-        self.playBtn = QtWidgets.QPushButton("▶ Play")
+        self.playBtn = QtWidgets.QPushButton()
+        set_button_icon(self.playBtn, "play", ICON_PLAY, "Play")
         self.playBtn.setMinimumHeight(40)
         self.playBtn.clicked.connect(self.play)
         ctrl_row.addWidget(self.playBtn)
-        self.stopBtn = QtWidgets.QPushButton("⏹ Stop")
+        self.stopBtn = QtWidgets.QPushButton()
+        set_button_icon(self.stopBtn, "stop", ICON_STOP, "Stop")
         self.stopBtn.setMinimumHeight(40)
         self.stopBtn.clicked.connect(self.stop)
         self.stopBtn.setEnabled(False)
         ctrl_row.addWidget(self.stopBtn)
         layout.addLayout(ctrl_row)
 
-        self.statusLabel = QtWidgets.QLabel("Έτοιμο")
+        self.statusLabel = QtWidgets.QLabel("Ready")
         self.statusLabel.setStyleSheet("color: gray;")
         layout.addWidget(self.statusLabel)
 
@@ -189,7 +224,7 @@ class MidiPlayerTab(QtWidgets.QWidget):
         try:
             mid = MidiFile(path)
         except Exception as e:
-            self.statusLabel.setText(f"❌ Σφάλμα φόρτωσης {os.path.basename(path)}: {e}")
+            self.statusLabel.setText(f"❌ Failed to load {os.path.basename(path)}: {e}")
             return events
         abs_time = 0.0
         for msg in mid:
@@ -204,7 +239,7 @@ class MidiPlayerTab(QtWidgets.QWidget):
 
         port_name = selected_port(self.portCombo)
         if not port_name:
-            self.statusLabel.setText("⚠️ Δεν επιλέχθηκε output port")
+            self.statusLabel.setText("⚠️ No output port selected")
             return
 
         # μάζεψε τα ενεργά (τσεκαρισμένα) αρχεία
@@ -215,14 +250,14 @@ class MidiPlayerTab(QtWidgets.QWidget):
                 active_paths.append(item.data(QtCore.Qt.UserRole))
 
         if not active_paths:
-            self.statusLabel.setText("⚠️ Δεν υπάρχουν ενεργά αρχεία")
+            self.statusLabel.setText("⚠️ No active files")
             return
 
         # άνοιξε το output port
         try:
             self.output_port = mido.open_output(port_name)
         except Exception as e:
-            self.statusLabel.setText(f"❌ Δεν άνοιξε το port: {e}")
+            self.statusLabel.setText(f"❌ Could not open port: {e}")
             return
 
         # φόρτωσε όλα τα ενεργά tracks
@@ -235,7 +270,7 @@ class MidiPlayerTab(QtWidgets.QWidget):
                 total_events += len(events)
 
         if not self.tracks:
-            self.statusLabel.setText("⚠️ Κανένα note στα επιλεγμένα αρχεία")
+            self.statusLabel.setText("⚠️ No notes in the selected files")
             safe_close(self.output_port, "output")
             self.output_port = None
             return
@@ -253,7 +288,7 @@ class MidiPlayerTab(QtWidgets.QWidget):
         self._lock_port_selection(True)
         self.playBtn.setEnabled(False)
         self.stopBtn.setEnabled(True)
-        self.statusLabel.setText(f"▶️ Παίζει {len(self.tracks)} track(s) — {total_events} events")
+        self.statusLabel.setText(f"▶️ Playing {len(self.tracks)} track(s) — {total_events} events")
 
     def _tick(self):
         if not self.playing:
@@ -302,7 +337,7 @@ class MidiPlayerTab(QtWidgets.QWidget):
         self._lock_port_selection(False)
         self.playBtn.setEnabled(True)
         self.stopBtn.setEnabled(False)
-        self.statusLabel.setText("⏹️ Σταματημένο")
+        self.statusLabel.setText("⏹️ Stopped")
 
 
 # ============================================================================
@@ -337,34 +372,36 @@ class MidiRecorderTab(QtWidgets.QWidget):
         layout.addLayout(port_row)
 
         opt_row = QtWidgets.QHBoxLayout()
-        opt_row.addWidget(QtWidgets.QLabel("BPM του αρχείου:"))
+        opt_row.addWidget(QtWidgets.QLabel("File BPM:"))
         self.bpmSpin = QtWidgets.QDoubleSpinBox()
         self.bpmSpin.setDecimals(2)
         self.bpmSpin.setRange(20.0, 400.0)
         self.bpmSpin.setValue(self.DEFAULT_BPM)
         opt_row.addWidget(self.bpmSpin)
         opt_row.addSpacing(20)
-        opt_row.addWidget(QtWidgets.QLabel("Στιγμή 0:"))
+        opt_row.addWidget(QtWidgets.QLabel("Time zero:"))
         self.zeroCombo = QtWidgets.QComboBox()
-        self.zeroCombo.addItem("Πάτημα Record", "press")
-        self.zeroCombo.addItem("Πρώτο μήνυμα", "first")
+        self.zeroCombo.addItem("Record press", "press")
+        self.zeroCombo.addItem("First message", "first")
         opt_row.addWidget(self.zeroCombo)
         opt_row.addStretch(1)
         layout.addLayout(opt_row)
 
         ctrl_row = QtWidgets.QHBoxLayout()
-        self.recordBtn = QtWidgets.QPushButton("⏺ Record")
+        self.recordBtn = QtWidgets.QPushButton()
+        set_button_icon(self.recordBtn, "record", ICON_RECORD, "Record")
         self.recordBtn.setMinimumHeight(40)
         self.recordBtn.clicked.connect(self.start_record)
         ctrl_row.addWidget(self.recordBtn)
-        self.stopBtn = QtWidgets.QPushButton("⏹ Stop & Save")
+        self.stopBtn = QtWidgets.QPushButton()
+        set_button_icon(self.stopBtn, "stop", ICON_STOP, "Stop && Save")
         self.stopBtn.setMinimumHeight(40)
         self.stopBtn.clicked.connect(self.stop_record)
         self.stopBtn.setEnabled(False)
         ctrl_row.addWidget(self.stopBtn)
         layout.addLayout(ctrl_row)
 
-        self.statusLabel = QtWidgets.QLabel("Έτοιμο")
+        self.statusLabel = QtWidgets.QLabel("Ready")
         self.statusLabel.setStyleSheet("color: gray;")
         layout.addWidget(self.statusLabel)
 
@@ -397,15 +434,16 @@ class MidiRecorderTab(QtWidgets.QWidget):
             return
         port_name = selected_port(self.portCombo)
         if not port_name:
-            self.statusLabel.setText("⚠️ Δεν επιλέχθηκε input port")
+            self.statusLabel.setText("⚠️ No input port selected")
             return
         try:
             self.input_port = mido.open_input(port_name)
         except Exception as e:
-            self.statusLabel.setText(f"❌ Δεν άνοιξε το port: {e}")
+            self.statusLabel.setText(f"❌ Could not open port: {e}")
             return
 
-        self.recorded = []
+        self.recorded = []                         # new recording: start from zero events
+        self.countLabel.setText("Events: 0")       # reset the counter shown in the window too
         self.t_press = time.perf_counter()
         self.recording = True
 
@@ -417,8 +455,8 @@ class MidiRecorderTab(QtWidgets.QWidget):
         self._lock_port_selection(True)
         self.recordBtn.setEnabled(False)
         self.stopBtn.setEnabled(True)
-        zero = "πάτημα Record" if self.zeroCombo.currentData() == "press" else "πρώτο μήνυμα"
-        self.statusLabel.setText(f"⏺️ Καταγραφή... (στιγμή 0 = {zero}, {self.bpmSpin.value():g} BPM)")
+        zero = "record press" if self.zeroCombo.currentData() == "press" else "first message"
+        self.statusLabel.setText(f"⏺️ Recording... (time zero = {zero}, {self.bpmSpin.value():g} BPM)")
 
     def _poll(self):
         if not self.recording or not self.input_port:
@@ -442,7 +480,7 @@ class MidiRecorderTab(QtWidgets.QWidget):
         self._lock_port_selection(False)
 
         if not self.recorded:
-            self.statusLabel.setText("⚠️ Δεν καταγράφηκε κανένα event")
+            self.statusLabel.setText("⚠️ No events recorded")
             self.recordBtn.setEnabled(True)
             self.stopBtn.setEnabled(False)
             return
@@ -455,9 +493,9 @@ class MidiRecorderTab(QtWidgets.QWidget):
         )
         if fname:
             self._save_midi(fname)
-            self.statusLabel.setText(f"💾 Αποθηκεύτηκε: {os.path.basename(fname)} ({len(self.recorded)} events)")
+            self.statusLabel.setText(f"💾 Saved: {os.path.basename(fname)} ({len(self.recorded)} events)")
         else:
-            self.statusLabel.setText("Ακυρώθηκε η αποθήκευση")
+            self.statusLabel.setText("Save cancelled")
 
         self.recordBtn.setEnabled(True)
         self.stopBtn.setEnabled(False)
@@ -502,14 +540,14 @@ class MidiRecorderTab(QtWidgets.QWidget):
 class MidiToolWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("MIDI Tool — Player & Recorder")
+        self.setWindowTitle("MIDIRooms MIDI Player & Recorder")
         self.resize(600, 500)
 
         tabs = QtWidgets.QTabWidget()
         self.player_tab = MidiPlayerTab()
         self.recorder_tab = MidiRecorderTab()
         tabs.addTab(self.player_tab, "🎵 MIDI Player")
-        tabs.addTab(self.recorder_tab, "⏺ MIDI Recorder")
+        tabs.addTab(self.recorder_tab, make_shape_icon("record", ICON_RECORD), "MIDI Recorder")
         self.setCentralWidget(tabs)
 
     def closeEvent(self, event):
@@ -530,8 +568,12 @@ class MidiToolWindow(QtWidgets.QMainWindow):
         event.accept()
 
 
-if __name__ == "__main__":
+def main():
     app = QtWidgets.QApplication(sys.argv)
     win = MidiToolWindow()
     win.show()
     sys.exit(app.exec_())
+
+
+if __name__ == "__main__":
+    main()

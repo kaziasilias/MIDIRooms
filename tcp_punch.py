@@ -208,12 +208,16 @@ class TcpLink:
     HEARTBEAT_S = 1.0
     DEAD_AFTER_S = 5.0
     ACK_DELAY = 0.003
+    CLOCK_SYNC_S = 3.0          # κάθε πόσο στέλνεται αίτημα συγχρονισμού ρολογιού προς τον peer
+    CLOCK_WINDOW = 8            # δείγματα από τα οποία κρατιέται αυτό με το μικρότερο RTT
+    CLOCK_BURST = 4             # αρχικά αιτήματα, ανά 0.25 s, ώστε να υπάρχει offset αμέσως μετά τη σύνδεση
 
-    def __init__(self, reader, writer, deliver, on_broken=None, max_age=3.0, clock=time.perf_counter):
+    def __init__(self, reader, writer, deliver, on_broken=None, max_age=3.0, clock=time.perf_counter, on_clock=None):
         self.reader = reader
         self.writer = writer
         self.deliver = deliver
         self.on_broken = on_broken
+        self.on_clock = on_clock            # callback(rtt_s, offset_s) σε κάθε νέο δείγμα συγχρονισμού ρολογιού
         self.max_age = max_age
         self.now = clock
         self.broken = False
@@ -225,6 +229,7 @@ class TcpLink:
         self.srtt = None
         self.last_rx = None
         self.last_ack = None
+        self.clock_samples = []             # (rtt_s, offset_s): offset = ρολόι_peer − δικό_μου
         self._ack_handle = None
         self._tasks = []
         self.stats = {"sent": 0, "retx": 0, "dups": 0, "delivered": 0, "acks_tx": 0, "hedged": 0}
@@ -297,6 +302,20 @@ class TcpLink:
                         self.srtt = rtt if self.srtt is None else 0.875 * self.srtt + 0.125 * rtt
                 elif k == "p":              # heartbeat: απάντηση με ack
                     self._schedule_ack()
+                elif k == "ts":             # αίτημα συγχρονισμού ρολογιού: απάντηση αμέσως με το ρολόι μου
+                    self._write({"k": "tr", "t0": pkt.get("t0"), "tb": self.now()})
+                elif k == "tr":             # απάντηση: Cristian/NTP πάνω στο ίδιο link που κουβαλά τις νότες
+                    t0, tb = pkt.get("t0"), pkt.get("tb")
+                    if t0 is not None and tb is not None:
+                        rtt = now - t0
+                        if rtt >= 0:
+                            self.clock_samples.append((rtt, tb - (t0 + rtt / 2.0)))
+                            del self.clock_samples[:-self.CLOCK_WINDOW]
+                            if self.on_clock is not None:
+                                try:
+                                    self.on_clock(rtt, self.peer_offset)
+                                except Exception as e:
+                                    print("⚠️ TCP P2P on_clock error:", e)
         except asyncio.CancelledError:
             pass
         except (ConnectionError, OSError) as e:
@@ -307,6 +326,8 @@ class TcpLink:
     # ---------- επίβλεψη ----------
     async def _watch_loop(self):
         last_hb = self.now()
+        last_cs = None
+        burst = self.CLOCK_BURST
         try:
             while not self.closed and not self.broken:
                 await asyncio.sleep(0.01)
@@ -320,6 +341,15 @@ class TcpLink:
                     last_hb = now
                     try:
                         self._write({"k": "p"})
+                    except Exception as e:
+                        self._break(f"write failed: {e}")
+                        return
+                gap = 0.25 if burst > 0 else self.CLOCK_SYNC_S
+                if last_cs is None or now - last_cs >= gap:
+                    last_cs = now
+                    burst = max(0, burst - 1)
+                    try:
+                        self._write({"k": "ts", "t0": now})
                     except Exception as e:
                         self._break(f"write failed: {e}")
                         return
@@ -345,7 +375,23 @@ class TcpLink:
                 "srtt_ms": None if self.srtt is None else self.srtt * 1000.0,
                 "since_rx_ms": None if self.last_rx is None else (now - self.last_rx) * 1000.0,
                 "since_ack_ms": None if self.last_ack is None else (now - self.last_ack) * 1000.0,
-                "wbuf": wbuf, **self.stats}
+                "wbuf": wbuf,
+                "clock_off_ms": None if self.peer_offset is None else self.peer_offset * 1000.0,
+                "clock_rtt_ms": None if self.peer_rtt is None else self.peer_rtt * 1000.0, **self.stats}
+
+    @property
+    def peer_offset(self):
+        """Offset του ρολογιού του peer (peer − εγώ, σε s) από το δείγμα με το μικρότερο RTT, ή None αν δεν υπάρχει."""
+        if not self.clock_samples:
+            return None
+        return min(self.clock_samples, key=lambda x: x[0])[1]
+
+    @property
+    def peer_rtt(self):
+        """Μικρότερο RTT (s) των τελευταίων δειγμάτων συγχρονισμού, ή None."""
+        if not self.clock_samples:
+            return None
+        return min(self.clock_samples, key=lambda x: x[0])[0]
 
     def pending_events(self):
         return [v[0] for v in self.unacked.values()]

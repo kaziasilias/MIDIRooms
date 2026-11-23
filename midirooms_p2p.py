@@ -191,12 +191,15 @@ class ExperimentRecorder:
       send_ms          : διάρκεια της κλήσης προς τη virtual θύρα
       eff_delay_ms     : max(delay, transit + 2) + lateness
       adaptive, server_offset_ms, server_jitter_ms
+      offset_src       : p2p (offset από το link με τον αποστολέα) / server (offset από τον server) / none
+      peer_offset_ms   : offset peer − εγώ (ms) που χρησιμοποιήθηκε όταν offset_src = p2p
     """
     RECV_COLS = ["seq", "user", "stream", "type", "ch", "note", "vel",
                  "arrival_s", "sender_ts_s", "transit_est_ms",
                  "buf_base_ms", "buf_extra_ms", "delay_ms", "slack_ms", "late",
                  "play_time_s", "played_s", "lateness_ms", "send_ms", "eff_delay_ms",
-                 "adaptive", "server_offset_ms", "server_jitter_ms", "status", "via"]
+                 "adaptive", "server_offset_ms", "server_jitter_ms", "status", "via",
+                 "offset_src", "peer_offset_ms"]
     SENT_COLS = ["seq", "stream", "type", "ch", "note", "vel", "send_ts_s", "input_ts"]
 
     def __init__(self):
@@ -1316,6 +1319,8 @@ class RoomWindow(QWidget):
                 extra = (_p2p_sctp_info(pc) if pc else "") + (f" buf={buf}" if buf is not None else "")
                 if snap.get("wbuf") is not None:
                     extra += f" wbuf={snap['wbuf']}"
+                if snap.get("clock_rtt_ms") is not None:
+                    extra += f" clk_rtt={snap['clock_rtt_ms']:.1f}ms clk_off={snap['clock_off_ms']:.2f}ms"
                 self.log_manager.log(
                     "SYSTEM",
                     f"📊 P2P {peer.user}{' STALL' if stalled else ''}: sent+{d('sent')} retx+{d('retx')} "
@@ -1330,8 +1335,43 @@ class RoomWindow(QWidget):
         except asyncio.CancelledError:
             pass
 
+    def _p2p_clock_log(self, peer, rtt, offset):
+        """Σε κάθε sync με έναν peer: ίδιες μετρικές και ίδια μορφή με το «Server sync» (latency = RTT/2)."""
+        oneway_ms = rtt * 1000.0 / 2.0
+        st = getattr(peer, "clock_stats", None)
+        if st is None or st.get("link") is not peer.link:       # νέο link = νέα στατιστικά
+            st = peer.clock_stats = {"link": peer.link, "n": 0, "sum": 0.0, "min": None, "max": None, "recent": []}
+        st["n"] += 1
+        st["sum"] += oneway_ms
+        st["min"] = oneway_ms if st["min"] is None else min(st["min"], oneway_ms)
+        st["max"] = oneway_ms if st["max"] is None else max(st["max"], oneway_ms)
+        st["recent"].append(oneway_ms)
+        del st["recent"][:-SYNC_RECENT]
+        r = st["recent"]
+        recent_label = "last 1 min" if len(r) == SYNC_RECENT else (f"last {len(r)} syncs" if len(r) > 1 else "last 1 sync")
+        if hasattr(self, "ui"):
+            self.log_manager.log("CLOCK",
+                                 f"🕒 {peer.user} sync: latency={oneway_ms:.1f}ms | "
+                                 f"overall: avg {st['sum'] / st['n']:.1f} / min {st['min']:.1f} / max {st['max']:.1f} ms | "
+                                 f"{recent_label}: avg {sum(r) / len(r):.1f} / min {min(r):.1f} / max {max(r):.1f} ms | "
+                                 f"offset={offset * 1000:.1f}ms")
+
+    def _sender_ts_local(self, data, sender_ts_server):
+        """Χρόνος αποστολής στο τοπικό ρολόι. Προτιμάται ο offset από το P2P link (ένα σφάλμα, η ίδια διαδρομή
+        με τις νότες)· αλλιώς ο offset από τον server· αλλιώς άμεση αναπαραγωγή (δεν υπάρχει συγχρονισμός)."""
+        tl, po = data.get("tl"), data.get("_peer_off")
+        if tl is not None and po is not None:
+            return tl - po, "p2p"
+        if self.server_clock_offset == 0.0:
+            return time.perf_counter(), "none"
+        return sender_ts_server - self.server_clock_offset, "server"
+
     def _p2p_deliver(self, peer, ev):
         ev["_via"] = "p2p"
+        # offset του ρολογιού του peer (peer − εγώ) από το ίδιο το link, ώστε το OWD να μη βασίζεται στον server
+        off = peer.link.peer_offset if peer.link is not None else None
+        if off is not None:
+            ev["_peer_off"] = off
         self.on_midi_message(json.dumps(ev))
 
     def _p2p_broken(self, peer, pending):
@@ -1623,7 +1663,8 @@ class RoomWindow(QWidget):
         link = tcp_punch.TcpLink(reader, writer,
                                  deliver=lambda ev: self._p2p_deliver(peer, ev),
                                  on_broken=lambda pending: self._p2p_broken(peer, pending),
-                                 max_age=P2P_MAX_ACK_AGE_S)
+                                 max_age=P2P_MAX_ACK_AGE_S,
+                                 on_clock=lambda rtt, off: self._p2p_clock_log(peer, rtt, off))
         peer.link = link
         link.start()
         peer.state = "up"
@@ -1644,6 +1685,8 @@ class RoomWindow(QWidget):
         """Στέλνει ένα MIDI event: απευθείας (P2P) σε όσους έχουν ενεργό link, μέσω server στους υπόλοιπους."""
         me = self.main_app.username
         ev.setdefault("sid", self.p2p_sid)
+        if "timestamp" in ev:                           # ρολόι αποστολέα (perf_counter) για P2P συγχρονισμό
+            ev.setdefault("tl", ev["timestamp"] - self.server_clock_offset)
         users = self.connected_users or []
         up = []
         if self.p2p_active():
@@ -2458,10 +2501,7 @@ class RoomWindow(QWidget):
                 self.record_midi_event(user=user, stream=stream, msg_type=msg_type,
                                        channel=ch, extra=params)
                 sender_ts_server = data.get("timestamp", time.perf_counter())
-                if self.server_clock_offset == 0.0:
-                    sender_ts_local = time.perf_counter()
-                else:
-                    sender_ts_local = sender_ts_server - self.server_clock_offset
+                sender_ts_local, off_src = self._sender_ts_local(data, sender_ts_server)
                 jitter_s = self.peer_jitter.get("_server", 0.005)
                 play_time = self._compute_play_time(sender_ts_local)
                 self.remote_midi_queue.append({
@@ -2488,12 +2528,7 @@ class RoomWindow(QWidget):
                     self.bump_velocity_bar(user, velocity)
 
                 sender_ts_server = data.get("timestamp", time.perf_counter())
-                if self.server_clock_offset == 0.0:
-                    # ο συγχρονισμός ρολογιού δεν έχει ολοκληρωθεί ακόμα —
-                    # παίξε άμεσα αντί να υπολογίσεις λάθος (τεράστιο) play_time
-                    sender_ts_local = time.perf_counter()
-                else:
-                    sender_ts_local = sender_ts_server - self.server_clock_offset
+                sender_ts_local, off_src = self._sender_ts_local(data, sender_ts_server)
 
                 jitter_s = self.peer_jitter.get("_server", 0.005)
                 play_time = self._compute_play_time(sender_ts_local)
@@ -2517,7 +2552,9 @@ class RoomWindow(QWidget):
                         "adaptive": int(self.adaptive_buffer),
                         "server_offset_ms": f"{self.server_clock_offset * 1000.0:.2f}",
                         "server_jitter_ms": f"{self.peer_jitter.get('_server', 0.0) * 1000.0:.2f}",
-                        "status": "nosync" if self.server_clock_offset == 0.0 else "ok",
+                        "status": "nosync" if off_src == "none" else "ok",
+                        "offset_src": off_src,
+                        "peer_offset_ms": "" if data.get("_peer_off") is None else f"{data['_peer_off'] * 1000.0:.2f}",
                         "via": data.get("_via", "relay"),
                     }
                 if DEBUG_CALC_PRINT:

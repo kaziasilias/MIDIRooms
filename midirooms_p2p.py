@@ -102,10 +102,269 @@ from username import Ui_Form as Ui_UsernameForm
 SIGNALING_SERVER = "ws://155.207.200.166:8080/ws"  # change to your VPS
 
 
-import subprocess, threading, queue
+import subprocess, threading, queue, traceback
+from urllib.parse import urlparse
 
 import csv as _csv_module
 from datetime import datetime as _dt
+
+WATCHDOG_ENABLED = True   # διαγνωστικό StallWatchdog (False = καθόλου timer/νήμα, στήλη loop_lag_ms κενή)
+
+
+class StallWatchdog:
+    """Διαγνωστικό: καταγράφει πότε το κύριο νήμα (GUI + asyncio/δίκτυο + MIDI) μένει μπλοκαρισμένο.
+
+    - Ένας QTimer 5 ms στο κύριο νήμα ενημερώνει κάθε φορά το `last_beat` (σφυγμός).
+    - Ένα ξεχωριστό νήμα ξυπνά κάθε 5 ms, μετρά πόσο καθυστέρησε το ίδιο (thread_lag) και ελέγχει
+      πόσο παλιός είναι ο σφυγμός του κύριου νήματος. Αν ο σφυγμός καθυστερεί πάνω από STALL_MS,
+      γράφεται γραμμή STALL στο αρχείο midirooms_stalls_<user>_<ώρα>.log, και πάνω από DUMP_MS
+      αποθηκεύεται η στοίβα (stack) του κύριου νήματος, δηλαδή η γραμμή κώδικα όπου έχει κολλήσει.
+    - thread_lag μεγάλο ταυτόχρονα με stall = φταίει το σύστημα (CPU/άλλη διεργασία/GIL).
+      thread_lag μικρό + stall μεγάλο = κάτι μέσα στο κύριο νήμα (π.χ. GUI/logging) το μπλοκάρει.
+    - lag_ms() δίνει το τρέχον lag, και γράφεται σε κάθε received event ως στήλη loop_lag_ms.
+    Δεν αγγίζει το πρωτόκολλο, το UI ή την αποστολή MIDI. Οι ώρες perf_counter είναι ίδιες με του CSV."""
+    INTERVAL_MS = 5.0
+    STALL_MS = 50.0     # κατώφλι για καταγραφή stall
+    DUMP_MS = 100.0     # από πότε αποθηκεύεται η στοίβα του κύριου νήματος
+    DUMP_EVERY_MS = 250.0
+    MINI_MS = 12.0      # μικρότερες καθυστερήσεις του κύριου νήματος (π.χ. ~20 ms): καταγράφονται με το ενεργό span
+    SPAN_LOG_MS = 10.0  # span που κρατά περισσότερο από αυτό γράφεται ως SPAN στο log
+    SUMMARY_EVERY_S = 20.0
+
+    def __init__(self):
+        self.enabled = False
+        self.last_beat = time.perf_counter()
+        self._last_stall_ms = 0.0
+        self._last_stall_end = 0.0
+        self._main_id = None
+        self._f = None
+        self._timer = None
+        self._stop = False
+        self.n_stalls = 0
+        self.path = None
+        self._wlock = threading.Lock()
+        self._stack = []          # ενεργά spans του κύριου νήματος (το γράφει μόνο το κύριο νήμα)
+        self.span_stats = {}      # label -> [n, total_ms, max_ms, n>5, n>10, n>20]
+        self.mini_stats = {}      # label -> [πλήθος mini-stalls, συνολικά ms]
+        self.n_mini = 0
+        self._next_summary = 0.0
+
+    def span_enter(self, label):
+        if not self.enabled or threading.get_ident() != self._main_id:
+            return None                      # μόνο το κύριο νήμα μετριέται (αλλιώς χαλά η στοίβα)
+        self._stack.append(label)
+        return time.perf_counter()
+
+    def span_exit(self, label, t0):
+        if t0 is None:
+            return
+        dt = (time.perf_counter() - t0) * 1000.0
+        try:
+            self._stack.pop()
+        except IndexError:
+            pass
+        st = self.span_stats.get(label)
+        if st is None:
+            st = self.span_stats[label] = [0, 0.0, 0.0, 0, 0, 0]
+        st[0] += 1
+        st[1] += dt
+        if dt > st[2]:
+            st[2] = dt
+        if dt > 5.0:
+            st[3] += 1
+            if dt > 10.0:
+                st[4] += 1
+                if dt > 20.0:
+                    st[5] += 1
+        if dt > self.SPAN_LOG_MS and self.enabled:
+            self._write(f"SPAN t={time.perf_counter():.6f} {label} {dt:.1f} ms")
+
+    def span(self, label):
+        return _Span(self, label)
+
+    def summary(self, final=False):
+        rows = []
+        for lab, (n, tot, mx, n5, n10, n20) in list(self.span_stats.items()):
+            rows.append((tot, lab, n, mx, n5, n10, n20))
+        rows.sort(reverse=True)
+        self._write(f"# SUMMARY{' (final)' if final else ''} t={time.perf_counter():.1f}  "
+                    f"spans: label n total_ms mean_ms max_ms  n>5  n>10  n>20")
+        for tot, lab, n, mx, n5, n10, n20 in rows:
+            self._write(f"#   {lab:<22} n={n:<7} total={tot:9.1f} mean={tot / max(n, 1):7.3f} max={mx:7.1f}  "
+                        f">5:{n5}  >10:{n10}  >20:{n20}")
+        mrows = sorted(((v[1], k, v[0]) for k, v in list(self.mini_stats.items())), reverse=True)
+        self._write(f"#   mini-stalls (>{self.MINI_MS:.0f} ms) total={self.n_mini}; ανά ενεργό span:")
+        for tot, k, n in mrows:
+            self._write(f"#     {k:<30} n={n:<5} total_ms={tot:.1f}")
+
+    def start(self, username):
+        """Να καλείται από το κύριο νήμα, μετά τη δημιουργία του QApplication."""
+        if self.enabled or not WATCHDOG_ENABLED:
+            return
+        try:
+            self._main_id = threading.get_ident()
+            stamp = _dt.now().strftime("%Y%m%d_%H%M%S")
+            self.path = f"midirooms_stalls_{username}_{stamp}.log"
+            self._f = open(self.path, "w", encoding="utf-8")
+            self._write(f"# StallWatchdog start wall={_dt.now().isoformat()} perf_counter={time.perf_counter():.6f} "
+                        f"interval={self.INTERVAL_MS} ms stall>{self.STALL_MS} ms dump>{self.DUMP_MS} ms")
+            self.last_beat = time.perf_counter()
+            self._timer = QtCore.QTimer()
+            self._timer.setTimerType(QtCore.Qt.PreciseTimer)
+            self._timer.timeout.connect(self._beat)
+            self._timer.start(int(self.INTERVAL_MS))
+            self._t = threading.Thread(target=self._run, name="midirooms-watchdog", daemon=True)
+            self.enabled = True
+            self._t.start()
+            print(f"🩺 StallWatchdog: {self.path}")
+        except Exception as e:
+            print(f"⚠️ StallWatchdog δεν ξεκίνησε: {e}")
+            self.enabled = False
+
+    def _beat(self):                       # τρέχει στο κύριο νήμα
+        self.last_beat = time.perf_counter()
+
+    def lag_ms(self):
+        """Πόσο καιρό (ms) το κύριο νήμα δεν είχε τρέξει τον σφυγμό. Αν μόλις τελείωσε ένα stall (< 50 ms πριν),
+        επιστρέφεται η διάρκειά του, ώστε να φαίνεται και όταν ο σφυγμός έτρεξε πριν από το event."""
+        if not self.enabled:
+            return 0.0
+        now = time.perf_counter()
+        cur = max(0.0, (now - self.last_beat) * 1000.0 - self.INTERVAL_MS)
+        if now - self._last_stall_end < 0.050:
+            cur = max(cur, self._last_stall_ms)
+        return cur
+
+    def _write(self, text):
+        try:
+            with self._wlock:
+                self._f.write(text + "\n")
+                self._f.flush()
+        except Exception:
+            pass
+
+    def note(self, text):
+        """Γραμμή πληροφορίας (π.χ. αργή κλήση bridge) από οποιοδήποτε νήμα, με ώρα perf_counter."""
+        if self.enabled:
+            self._write(f"NOTE t={time.perf_counter():.6f} {text}")
+
+    def _main_stack(self):
+        try:
+            fr = sys._current_frames().get(self._main_id)
+            if fr is None:
+                return []
+            lines = []
+            for entry in traceback.format_stack(fr)[-6:]:
+                lines.extend(l for l in entry.rstrip().splitlines())
+            return lines
+        except Exception:
+            return []
+
+    def _run(self):                        # ξεχωριστό νήμα
+        iv = self.INTERVAL_MS / 1000.0
+        in_stall = False
+        stall_start = 0.0
+        thr_max = 0.0
+        next_dump = self.DUMP_MS
+        stacks = []
+        in_mini = False
+        mini_start = 0.0
+        mini_labels = []
+        expected = time.perf_counter() + iv
+        self._next_summary = expected + self.SUMMARY_EVERY_S
+        while not self._stop:
+            time.sleep(iv)
+            now = time.perf_counter()
+            thr_lag = max(0.0, (now - expected) * 1000.0)       # καθυστέρηση του ίδιου του watchdog νήματος
+            expected = now + iv
+            age = (now - self.last_beat) * 1000.0 - self.INTERVAL_MS
+            if now >= self._next_summary:
+                self._next_summary = now + self.SUMMARY_EVERY_S
+                try:
+                    self.summary()
+                except Exception:
+                    pass
+            # --- μικρές καθυστερήσεις (MINI_MS..STALL_MS): ποιο span ήταν ενεργό
+            if age > self.MINI_MS:
+                if not in_mini:
+                    in_mini = True
+                    mini_start = self.last_beat
+                    mini_labels = []
+                try:
+                    cur = ">".join(self._stack[-3:]) or "(event loop/Qt)"
+                except Exception:
+                    cur = "?"
+                if cur not in mini_labels:
+                    mini_labels.append(cur)
+            elif in_mini:
+                in_mini = False
+                dur = (self.last_beat - mini_start) * 1000.0
+                if dur < self.STALL_MS:           # τα μεγάλα γράφονται ήδη ως STALL
+                    self.n_mini += 1
+                    key = mini_labels[0] if mini_labels else "?"
+                    ms = self.mini_stats.setdefault(key, [0, 0.0])
+                    ms[0] += 1
+                    ms[1] += dur
+                    self._write(f"MINI t={mini_start:.6f} {dur:.1f} ms thr_lag={thr_lag:.1f} active={' | '.join(mini_labels)}")
+            if age > self.STALL_MS:
+                if not in_stall:
+                    in_stall = True
+                    stall_start = self.last_beat
+                    thr_max = 0.0
+                    next_dump = self.DUMP_MS
+                    stacks = []
+                thr_max = max(thr_max, thr_lag)
+                if age >= next_dump:
+                    stacks.append((age, self._main_stack()))
+                    next_dump = age + self.DUMP_EVERY_MS
+            elif in_stall:
+                in_stall = False
+                dur = (self.last_beat - stall_start) * 1000.0
+                self._last_stall_ms = dur
+                self._last_stall_end = now
+                self.n_stalls += 1
+                self._write(f"[{_dt.now().strftime('%H:%M:%S.%f')[:-3]}] STALL {dur:.1f} ms "
+                            f"(perf_counter {stall_start:.6f} -> {self.last_beat:.6f}) "
+                            f"watchdog_thread_lag_max={thr_max:.1f} ms")
+                for a, st in stacks:
+                    self._write(f"    stack @ +{a:.0f} ms:")
+                    for l in st:
+                        self._write("      " + l)
+
+
+class _Span:
+    __slots__ = ("wd", "label", "t0")
+
+    def __init__(self, wd, label):
+        self.wd = wd
+        self.label = label
+
+    def __enter__(self):
+        self.t0 = self.wd.span_enter(self.label)
+        return self
+
+    def __exit__(self, *a):
+        self.wd.span_exit(self.label, self.t0)
+        return False
+
+
+STALL_WD = StallWatchdog()
+
+
+def spanned(label):
+    """Μετρά πόση ώρα κρατά μια συνάρτηση του ΚΥΡΙΟΥ νήματος (όχι async) και την καταγράφει στο StallWatchdog."""
+    import functools
+
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*a, **k):
+            t0 = STALL_WD.span_enter(label)
+            try:
+                return fn(*a, **k)
+            finally:
+                STALL_WD.span_exit(label, t0)
+        return wrapper
+    return deco
 
 
 class _BgWriter:
@@ -193,13 +452,14 @@ class ExperimentRecorder:
       adaptive, server_offset_ms, server_jitter_ms
       offset_src       : p2p (offset από το link με τον αποστολέα) / server (offset από τον server) / none
       peer_offset_ms   : offset peer − εγώ (ms) που χρησιμοποιήθηκε όταν offset_src = p2p
+      loop_lag_ms      : πόση ώρα (ms) το κύριο νήμα δεν είχε τρέξει τον σφυγμό του StallWatchdog τη στιγμή του event
     """
     RECV_COLS = ["seq", "user", "stream", "type", "ch", "note", "vel",
                  "arrival_s", "sender_ts_s", "transit_est_ms",
                  "buf_base_ms", "buf_extra_ms", "delay_ms", "slack_ms", "late",
                  "play_time_s", "played_s", "lateness_ms", "send_ms", "eff_delay_ms",
                  "adaptive", "server_offset_ms", "server_jitter_ms", "status", "via",
-                 "offset_src", "peer_offset_ms"]
+                 "offset_src", "peer_offset_ms", "loop_lag_ms", "bridge_q"]
     SENT_COLS = ["seq", "stream", "type", "ch", "note", "vel", "send_ts_s", "input_ts"]
 
     def __init__(self):
@@ -286,6 +546,42 @@ class LogManager:
         self.csv_writer = None
         self.file_enabled = False
         self.file_path = None
+        # ομαδοποίηση του room log (UI): τα μηνύματα μαζεύονται και γράφονται μία φορά ανά UI_FLUSH_MS
+        self._ui_pending = []
+        self._ui_flush_scheduled = False
+
+    UI_FLUSH_MS = 100
+
+    @spanned("ui_log_flush")
+    def flush_ui(self):
+        self._ui_flush_scheduled = False
+        batch, self._ui_pending = self._ui_pending, []
+        if not batch:
+            return
+        try:
+            area = self.room_window.ui.logArea
+            area.setUpdatesEnabled(False)
+            try:
+                for m in batch:
+                    area.append(m)
+            finally:
+                area.setUpdatesEnabled(True)
+        except Exception:
+            pass
+
+    def _ui_append(self, message):
+        """Μη μπλοκαριστική: βάζει το μήνυμα σε ουρά και προγραμματίζει ένα flush στο κύριο νήμα."""
+        try:
+            on_main = QtCore.QThread.currentThread() == QtWidgets.QApplication.instance().thread()
+        except Exception:
+            on_main = True
+        if not on_main:
+            self.room_window.ui.logArea.append(message)   # όπως πριν (σπάνιο)
+            return
+        self._ui_pending.append(message)
+        if not self._ui_flush_scheduled:
+            self._ui_flush_scheduled = True
+            QtCore.QTimer.singleShot(self.UI_FLUSH_MS, self.flush_ui)
 
     # ---- διαχείριση peer κατηγοριών ----
     def ensure_peer(self, username):
@@ -323,6 +619,7 @@ class LogManager:
         self.file_path = None
 
     # ---- κύρια μέθοδος logging ----
+    @spanned("log_total")
     def log(self, category, message, peer=None):
         """
         category: μία από τις CATEGORIES, ή None αν είναι peer message
@@ -343,7 +640,8 @@ class LogManager:
         # 2) room log (UI)
         if route.get("room", False):
             try:
-                self.room_window.ui.logArea.append(message)
+                with STALL_WD.span("ui_log_append"):
+                    self._ui_append(message)
             except Exception:
                 pass
 
@@ -542,6 +840,63 @@ class VirtualMidiBridge:
         # MIDI outputs opened by Python toward the virtual ports
         self.output_cache = {}
 
+        # Ασύγχρονη ουρά εντολών: το κύριο νήμα (GUI/δίκτυο) δεν περιμένει ποτέ την απάντηση του exe.
+        # Ένα νήμα-εργάτης εκτελεί τις εντολές με τη σειρά (FIFO): create → send → close για την ίδια θύρα.
+        self._wq = queue.Queue()
+        self._failed = set()           # θύρες όπου απέτυχε το CREATE
+        self._slow_ms = 50.0
+        self._worker_t = threading.Thread(target=self._worker, name="midirooms-bridge", daemon=True)
+        self._worker_t.start()
+
+    def _worker(self):
+        while True:
+            item = self._wq.get()
+            if item is None:
+                break
+            kind, name, arg = item
+            t0 = time.perf_counter()
+            try:
+                if kind == "send":
+                    if name not in self._failed:
+                        self.send_hex(name, arg)
+                elif kind == "create":
+                    if self.create(name, settle=arg):
+                        self._failed.discard(name)
+                    else:
+                        self._failed.add(name)
+                elif kind == "close":
+                    self.close(name)
+                    self._failed.discard(name)
+            except Exception as e:
+                print(f"❌ bridge worker ({kind} {name}): {e}")
+            dt = (time.perf_counter() - t0) * 1000.0
+            if dt > self._slow_ms:
+                msg = f"BRIDGE_SLOW kind={kind} port={name} took={dt:.1f}ms queue={self._wq.qsize()}"
+                try:
+                    _BgWriter.get().print(msg)
+                except Exception:
+                    pass
+                try:
+                    STALL_WD.note(msg)
+                except Exception:
+                    pass
+
+    def queue_len(self) -> int:
+        return self._wq.qsize()
+
+    def port_failed(self, name: str) -> bool:
+        return name in self._failed
+
+    def send_hex_async(self, name: str, hex_bytes: str):
+        """Μπαίνει στην ουρά και επιστρέφει αμέσως (δεν μπλοκάρει το κύριο νήμα)."""
+        self._wq.put(("send", name, hex_bytes))
+
+    def create_async(self, name: str, settle: float = 0.2):
+        self._wq.put(("create", name, settle))
+
+    def close_async(self, name: str):
+        self._wq.put(("close", name, None))
+
     def _reader(self):
         for line in self.p.stdout:
             line = line.rstrip("\n")
@@ -604,10 +959,16 @@ class VirtualMidiBridge:
             return False
 
     def send_hex_nowait(self, name: str, hex_bytes: str):
-        """Στέλνει MIDI και ΔΙΑΒΑΖΕΙ το OK, ώστε να μη μένουν ορφανές απαντήσεις."""
-        self.send_hex(name, hex_bytes)
+        """Μη μπλοκαριστική αποστολή: μπαίνει στην ουρά του νήματος-εργάτη (η απάντηση OK διαβάζεται εκεί)."""
+        self.send_hex_async(name, hex_bytes)
 
     def shutdown(self):
+        # σταμάτα πρώτα τον εργάτη (να μη τρέχει εντολή ταυτόχρονα με το EXIT)
+        try:
+            self._wq.put(None)
+            self._worker_t.join(timeout=3.0)
+        except Exception:
+            pass
         for name in list(self.output_cache.keys()):
             try:
                 self.output_cache[name].close()
@@ -1067,6 +1428,9 @@ class RoomWindow(QWidget):
         self.setWindowTitle(f"MIDIRooms Room - {room_name}")
         self.ui.LeaveButton.clicked.connect(self.leave_room)
         self.ui.logArea.clear()
+        # η διεύθυνση του server (signaling) εμφανίζεται πάνω από το log του δωματίου
+        _srv = urlparse(SIGNALING_SERVER)
+        self.ui.loglabel.setText(f"MIDI Log  —  Server: {_srv.hostname}:{_srv.port or ''}".rstrip(":"))
         self.log_manager = LogManager(self)
         self._auto_start_room_log()
         self.user_ui_elements = {}
@@ -1681,6 +2045,7 @@ class RoomWindow(QWidget):
             peer.stats.cancel()
         peer.stats = asyncio.ensure_future(self._p2p_stats_loop(peer, link))
 
+    @spanned("dispatch_event")
     def dispatch_midi_event(self, ev):
         """Στέλνει ένα MIDI event: απευθείας (P2P) σε όσους έχουν ενεργό link, μέσω server στους υπόλοιπους."""
         me = self.main_app.username
@@ -1732,6 +2097,7 @@ class RoomWindow(QWidget):
         """Όνομα συσκευής όπως το βλέπουν οι άλλοι (για loopback του χρήστη με την πλευρά, π.χ. 'Jam Pad (B)')."""
         return display_name(dev_name)
 
+    @spanned("streams_announce")
     def send_streams_announce(self):
         if not self.main_app.ws:
             return
@@ -1814,6 +2180,7 @@ class RoomWindow(QWidget):
         dlg.exec_()
         self.main_app.routing_manager_dialog = None
 
+    @spanned("hotplug_scan")
     def scan_new_midi_inputs(self):
         import mido
         from mido import open_input
@@ -1950,6 +2317,7 @@ class RoomWindow(QWidget):
         except Exception as e:
             print("⚠️ Failed to send clock_sync:", e)
 
+    @spanned("clock_sync")
     def handle_clock_sync(self, data):
         """Υπολογίζει το offset από το ρολόι του server (NTP-style)."""
         t2 = time.perf_counter()
@@ -1999,6 +2367,7 @@ class RoomWindow(QWidget):
                                  f"{recent_label}: avg {sum(r) / len(r):.1f} / min {min(r):.1f} / max {max(r):.1f} ms | "
                                  f"offset={offset * 1000:.1f}ms"
                                  )
+    @spanned("pong")
     def handle_pong(self, data):
         return
 
@@ -2196,6 +2565,7 @@ class RoomWindow(QWidget):
         }))
         print(f"🟢 {self.main_app.username} joined room '{self.room_name}' (TCP mode)")
 
+    @spanned("poll_local_midi")
     def poll_midi_input(self):
         if not self.midi_inputs:
             return
@@ -2350,6 +2720,7 @@ class RoomWindow(QWidget):
         dlg = LogSettingsDialog(self)
         dlg.exec_()
 
+    @spanned("rx_msg")
     def on_midi_message(self, message):
         if self._left:
             return
@@ -2401,7 +2772,14 @@ class RoomWindow(QWidget):
                     app.stream_meta[key] = {"device": device, "room": room}
                     app.stream_pretty[key] = f"{sender} — {display_name(device)}"
 
-                    if app.routing_config.get(key, {}).get("vmidi"):
+                    _ex = app.routing_config.get(key, {}).get("vmidi")
+                    if _ex and getattr(app, "vmidi", None) and app.vmidi.port_failed(_ex):
+                        # το ασύγχρονο CREATE απέτυχε: καθάρισε και ξαναδοκίμασε
+                        print(f"⚠️ Port {_ex} δεν δημιουργήθηκε, νέα προσπάθεια")
+                        app.close_remote_port(_ex)
+                        app.routing_config.pop(key, None)
+                        _ex = None
+                    if _ex:
                         continue  # υπάρχει ήδη port
 
                     name = app.open_remote_port(key, device)
@@ -2556,6 +2934,7 @@ class RoomWindow(QWidget):
                         "offset_src": off_src,
                         "peer_offset_ms": "" if data.get("_peer_off") is None else f"{data['_peer_off'] * 1000.0:.2f}",
                         "via": data.get("_via", "relay"),
+                        "loop_lag_ms": f"{STALL_WD.lag_ms():.1f}",   # πόση ώρα το κύριο νήμα δεν είχε τρέξει (StallWatchdog)
                     }
                 if DEBUG_CALC_PRINT:
                     print(f"CALC ts_server={sender_ts_server:.1f} my_offset={self.server_clock_offset:.1f} play_time={play_time:.1f} now={time.perf_counter():.1f} diff={play_time-time.perf_counter():.3f}")
@@ -2658,6 +3037,7 @@ class RoomWindow(QWidget):
             self.buffer_extra_s = 0.0
         self._refresh_buffer_label()
 
+    @spanned("buffer_label")
     def _refresh_buffer_label(self):
         base = int(round(self.buffer_base_s * 1000))
         extra = int(round(self.buffer_extra_s * 1000))
@@ -2690,6 +3070,7 @@ class RoomWindow(QWidget):
             play_time = max(sender_ts_local + self.buffer_base_s + self.buffer_extra_s, now + 0.002)
         return play_time
 
+    @spanned("play_queue")
     def process_remote_midi_queue(self):
         if not self.remote_midi_queue:
             return
@@ -2714,6 +3095,7 @@ class RoomWindow(QWidget):
             stream = event["stream"]
             msg_type = event["type"]
             send_ms_val = None
+            bridge_q_val = ""
             try:
                 if "params" in event:
                     msg = Message(msg_type, **event["params"])
@@ -2732,9 +3114,10 @@ class RoomWindow(QWidget):
                     b = msg.bytes()
                     hex_bytes = " ".join(f"{x:02X}" for x in b)
                     _t_send0 = time.perf_counter()
-                    r = self.main_app.vmidi.send_hex(vmidi_name, hex_bytes)
-                    send_ms_val = (time.perf_counter() - _t_send0) * 1000.0
-                    print(f"SEND→BRIDGE port={vmidi_name} hex={hex_bytes} result={r}")
+                    bridge_q_val = self.main_app.vmidi.queue_len()
+                    self.main_app.vmidi.send_hex_async(vmidi_name, hex_bytes)   # δεν περιμένει το exe
+                    send_ms_val = (time.perf_counter() - _t_send0) * 1000.0     # πλέον = χρόνος εισαγωγής στην ουρά
+                    _BgWriter.get().print(f"SEND→BRIDGE port={vmidi_name} hex={hex_bytes} q={bridge_q_val}")
                 else:
                     print(
                         f"NO SEND: vmidi_name={vmidi_name} vmidi_obj={getattr(self.main_app, 'vmidi', None) is not None}")
@@ -2751,10 +3134,12 @@ class RoomWindow(QWidget):
                     rec["played_s"] = f"{actual_play_ts:.6f}"
                     rec["lateness_ms"] = f"{lateness_ms:.3f}"
                     rec["send_ms"] = "" if send_ms_val is None else f"{send_ms_val:.3f}"
+                    rec["bridge_q"] = bridge_q_val
                     rec["eff_delay_ms"] = f"{max(delay_ms, transit_ms + 2.0) + lateness_ms:.3f}"
                     self.exp.log_received(rec)
                 except Exception as e:
                     print("⚠️ experiment log error:", e)
+    @spanned("send_midi_gui")
     def send_midi(self, note, velocity):
         if not self.main_app.ws:
             return
@@ -2913,19 +3298,11 @@ class RoomWindow(QWidget):
         bar.setValue(0)
         outer.addWidget(bar)
 
-        # --- Row 3: latency label ---
-        latency_label = QtWidgets.QLabel("Latency: -- ms")
-        latency_label.setStyleSheet("color: gray; font-size: 10px;")
-        if username == self.main_app.username:
-            latency_label.hide()
-        outer.addWidget(latency_label)
-
         self.ui.uservelocityLayout.addWidget(container)
 
         # Store
         self.user_ui_elements[username] = container
         self.user_velocity_bars[username] = bar
-        self.user_latency_labels[username] = latency_label
 
         # Apply visibility rule now (in case leader already known)
         self.update_leader_ui(getattr(self.main_app, "room_leader", None))
@@ -3086,7 +3463,7 @@ class RoomWindow(QWidget):
                 QtCore.QTimer.singleShot(
                     60,
                     lambda port=self.metronome_port_name, h=hex_off:
-                    self.main_app.vmidi.send_hex(port, h)
+                    self.main_app.vmidi.send_hex_nowait(port, h)
                 )
 
     def start_recording(self):
@@ -4065,16 +4442,16 @@ class MidiUserApp(QMainWindow):
             suffix = f"_{n}"
             name = base[:PORT_BASE_MAX - len(suffix)] + suffix
             n += 1
-        if self.vmidi.create(name, settle=0.2):
-            self.created_vmidi_ports.add(name)
-            return name
-        return None
+        # ασύγχρονα: το όνομα δεσμεύεται αμέσως, το CREATE εκτελείται από το νήμα του bridge (FIFO πριν από τα SEND)
+        self.created_vmidi_ports.add(name)
+        self.vmidi.create_async(name, settle=0.2)
+        return name
 
     def close_remote_port(self, name):
         if not name or name == getattr(self, "metronome_port_name", None):
             return
         if getattr(self, "vmidi", None) and name in self.created_vmidi_ports:
-            self.vmidi.close(name)
+            self.vmidi.close_async(name)
             self.created_vmidi_ports.discard(name)
             print(f"♻️ Closed port {name}")
 
@@ -4405,6 +4782,7 @@ if __name__ == "__main__":
     window.refresh_username_label()
     window.init_vmidi_pool()      # δημιουργία ΟΛΩΝ των virtual ports πριν ανοίξει οποιαδήποτε είσοδος
     window.show()
+    STALL_WD.start(window.username)   # διαγνωστικό: καταγραφή stalls του κύριου νήματος
 
     with loop:
         loop.run_forever()

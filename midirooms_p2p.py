@@ -900,8 +900,8 @@ class VirtualMidiBridge:
     def _reader(self):
         for line in self.p.stdout:
             line = line.rstrip("\n")
-            print(f"BRIDGE OUT: {line!r}")
-            self._q.put(line)
+            self._q.put(line)                                  # πρώτα η απάντηση στο worker (να μη περιμένει την κονσόλα)
+            _BgWriter.get().print(f"BRIDGE OUT: {line!r}")      # το print γίνεται από το νήμα εξόδου
 
     def _cmd(self, line: str, timeout: float = 2.0) -> str:
         with self._lock:

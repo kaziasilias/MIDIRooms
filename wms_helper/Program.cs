@@ -4,6 +4,8 @@
 // For every port "name" a loopback pair is created:
 //   "<name>"       (B side)  -> the DAW opens this one as MIDI input
 //   "<name> (tx)"  (A side)  -> this helper writes into it
+using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Text;
 using Windows.Devices.Midi2;
 using Windows.Devices.Midi2.Enumeration;
@@ -15,20 +17,42 @@ const string DawSuffix = " (DAW)";    // B side: το ανοίγει το DAW ω
 const int MaxName = 31; // WinMM port name limit
 
 var logPath = Path.Combine(AppContext.BaseDirectory, "midiroomsports_wms.log");
+// Το log γράφεται από ξεχωριστό νήμα μέσω ουράς: ο βρόχος των εντολών δεν περιμένει ποτέ τον δίσκο
+// (πριν, κάθε εντολή άνοιγε/έγραφε/έκλεινε το αρχείο μέσα στον βρόχο).
+var logQueue = new BlockingCollection<string>(new ConcurrentQueue<string>());
+var logThread = new Thread(() =>
+{
+    try
+    {
+        using var w = new StreamWriter(new FileStream(logPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite), new UTF8Encoding(false));
+        foreach (var entry in logQueue.GetConsumingEnumerable())
+        {
+            w.WriteLine(entry);
+            if (logQueue.Count == 0) w.Flush();
+        }
+        w.Flush();
+    }
+    catch { }
+}) { IsBackground = true, Name = "midirooms-log" };
+logThread.Start();
 void Log(string s)
 {
-    try { File.AppendAllText(logPath, $"{DateTime.Now:HH:mm:ss.fff} {s}{Environment.NewLine}"); } catch { }
+    try { logQueue.Add($"{DateTime.Now:HH:mm:ss.fff} {s}"); } catch { }
+}
+void FlushLog()
+{
+    try { logQueue.CompleteAdding(); logThread.Join(2000); } catch { }
 }
 
 var stdout = new StreamWriter(Console.OpenStandardOutput(), new UTF8Encoding(false)) { AutoFlush = true, NewLine = "\n" };
 void Reply(string s) => stdout.WriteLine(s);
 
-if (!MidiApi.EnsureServiceAvailable()) { Log("EnsureServiceAvailable failed"); Reply("ERR midi service not available"); return 1; }
-if (!MidiLoopbackManager.IsTransportAvailable) { Log("Loopback transport not available"); Reply("ERR loopback transport not available"); return 1; }
+if (!MidiApi.EnsureServiceAvailable()) { Log("EnsureServiceAvailable failed"); Reply("ERR midi service not available"); FlushLog(); return 1; }
+if (!MidiLoopbackManager.IsTransportAvailable) { Log("Loopback transport not available"); Reply("ERR loopback transport not available"); FlushLog(); return 1; }
 Log($"API system provided={MidiApi.IsSystemProvided()}");
 
 using var session = MidiSession.Create("MIDIRooms");
-if (session == null) { Log("MidiSession.Create failed"); Reply("ERR session"); return 1; }
+if (session == null) { Log("MidiSession.Create failed"); Reply("ERR session"); FlushLog(); return 1; }
 
 // remove pairs left behind by a previous crash (recognised by the " (tx)" suffix)
 int SweepOrphans()
@@ -78,10 +102,12 @@ while ((line = Console.ReadLine()) != null)
 {
     line = line.Trim();
     if (line.Length == 0) continue;
-    Log("RX " + line);
+    var sw = Stopwatch.StartNew();       // χρόνος επεξεργασίας της εντολής μέσα στο exe
 
     var parts = line.Split('|', 4);
     var cmd = parts[0].ToUpperInvariant();
+    if (cmd != "SEND") Log("RX " + line);   // τα SEND δεν γράφονται (πολλά)
+    double sendMs = 0;
 
     try
     {
@@ -138,7 +164,9 @@ while ((line = Console.ReadLine()) != null)
                 if (parts.Length < 3) { Reply("ERR usage SEND|name|hex"); break; }
                 if (!ports.TryGetValue(parts[1].Trim(), out var port)) { Reply("ERR unknown port"); break; }
 
+                var t0 = Stopwatch.GetTimestamp();
                 var err = port.SendHex(parts[2]);
+                sendMs = Stopwatch.GetElapsedTime(t0).TotalMilliseconds;   // μόνο η κλήση προς το Windows MIDI Services
                 if (err == null) Reply("OK");
                 else { Log($"SEND {parts[1]} {parts[2]} -> {err}"); Reply("ERR " + err); }
                 break;
@@ -161,6 +189,7 @@ while ((line = Console.ReadLine()) != null)
                 RemoveAll();
                 Log("EXIT");
                 Reply("OK");
+                FlushLog();
                 Environment.Exit(0);
                 return 0;
             }
@@ -175,10 +204,16 @@ while ((line = Console.ReadLine()) != null)
         Log($"EXC in {cmd}: {e}");
         Reply("ERR " + e.Message.Replace('\n', ' ').Replace('\r', ' '));
     }
+
+    // χρονισμός: όλα τα CREATE/CLOSE, και τα SEND μόνο αν κράτησαν >= 5 ms
+    var totalMs = sw.Elapsed.TotalMilliseconds;
+    if (cmd != "SEND" || totalMs >= 5.0)
+        Log($"T {cmd} total={totalMs:F1} ms" + (cmd == "SEND" ? $" send_call={sendMs:F1} ms port={(parts.Length > 1 ? parts[1] : "")}" : ""));
 }
 
 // stdin closed (the Python app exited): clean up
 RemoveAll();
+FlushLog();
 return 0;
 
 sealed class Port
